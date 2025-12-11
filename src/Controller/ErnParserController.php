@@ -49,6 +49,7 @@ use DedexBundle\Entity\Ern381\EventDateTimeType as Ern381EventDateTimeType;
 use DedexBundle\Entity\Ern383\EventDateTimeType as Ern383EventDateTimeType;
 use DedexBundle\Entity\Ern382\EventDateTimeType as Ern382EventDateTimeType;
 use DedexBundle\Entity\Ern411\EventDateTimeType as Ern411EventDateTimeType;
+use DedexBundle\Entity\Ern32\EventDateTimeType as Ern32EventDateTimeType;
 
 /**
  * The main generic parser for XML files. Will load elements one by one
@@ -291,6 +292,10 @@ class ErnParserController {
 
     if ($class_name === "\DedexBundle\Entity\Ern382\EventDateTimeType") {
       return new \DedexBundle\Entity\Ern382\EventDateTimeType(new \DateTime()); // TODO
+    }
+
+    if ($class_name === "\DedexBundle\Entity\Ern32\EventDateTimeType") {
+      return new \DedexBundle\Entity\Ern32\EventDateTimeType(new \DateTime());
     }
 
     if ($class_name === "\DedexBundle\Entity\Ern43\EventDateTimeWithoutFlagsType") {
@@ -701,8 +706,9 @@ class ErnParserController {
 
   /**
    * Look for text xmlns:ern="http://ddex.net/xml/ern/382" or 41 in XML file
+   * Also handles ERN-Main 32: xmlns:ern="http://ddex.net/xml/2010/ern-main/32"
    * @param filedescription $fp Open wml file. Considered as valid XML file at this point
-   * @return string version such as "382" or "41"
+   * @return string version such as "382" or "41" or "32"
    * @throws Exception
    */
   private function detectVersion($fp) {
@@ -716,6 +722,7 @@ class ErnParserController {
         "383",
         "341",
         "371",
+        "32",
     ];
 
     while (($buffer = fgets($fp, 4096)) !== false) {
@@ -724,7 +731,16 @@ class ErnParserController {
         continue;
       }
 
-      // Try to find version in this line
+      // Try to find ERN-Main 32 namespace first (http://ddex.net/xml/2010/ern-main/32)
+      $re_ern_main = '/xmlns:ernm?="https?:\/\/ddex.net\/xml\/2010\/ern-main\/(\d+)"/m';
+      preg_match_all($re_ern_main, $trimed, $matches_ern_main, PREG_SET_ORDER, 0);
+      
+      if (!empty($matches_ern_main)) {
+        $version = $matches_ern_main[0][1];
+        break;
+      }
+
+      // Try to find version in this line (standard ERN pattern)
       $re = '/xmlns:ernm?="https?:\/\/ddex.net\/xml\/ern\/(\d+)"/m';
       preg_match_all($re, $trimed, $matches, PREG_SET_ORDER, 0);
 

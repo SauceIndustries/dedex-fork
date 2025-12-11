@@ -13,6 +13,9 @@ use DedexBundle\Entity\Ern382\ReleaseType;
 use DedexBundle\Entity\Ern382\ResourceContributor;
 use DedexBundle\Entity\Ern382\SoundRecordingDetailsByTerritoryType;
 use DedexBundle\Entity\Ern382\TechnicalSoundRecordingDetailsType;
+use DedexBundle\Entity\Ern32\NewReleaseMessage as Ern32NewReleaseMessage;
+use DedexBundle\Entity\Ern32\SoundRecordingType as Ern32SoundRecordingType;
+use DedexBundle\Entity\Ern32\ReleaseType as Ern32ReleaseType;
 use DedexBundle\Exception\FileNotFoundException;
 use DedexBundle\Exception\XmlLoadException;
 use DedexBundle\Exception\XmlParseException;
@@ -233,6 +236,139 @@ class ParserControllerTest extends TestCase {
     // ERN version is now 411. It is using classes with namespace 411.
     // ERN 411 does not have a getMessageSchemaVersionId() function
     $this->assertEquals('DedexBundle\Entity\Ern411\NewReleaseMessage', get_class($ddex));
+  }
+
+  /**
+   * Test ERN-Main 32 is parsed correctly
+   */
+  public function testSample018Ern32() {
+    $xml_path = "tests/samples/018_ern32_single.xml";
+    $parser_controller = new ErnParserController();
+    // Set this to true to see logs from the parser
+    $parser_controller->setDisplayLog(false);
+    /* @var $ddex Ern32NewReleaseMessage */
+    $ddex = $parser_controller->parse($xml_path);
+
+    // ERN-Main 32 should use classes with namespace Ern32
+    $this->assertEquals('DedexBundle\Entity\Ern32\NewReleaseMessage', get_class($ddex));
+
+    // ERN attributes
+    $this->assertEquals("2010/ern-main/32", $ddex->getMessageSchemaVersionId());
+    $this->assertEquals("en", $ddex->getLanguageAndScriptCode());
+
+    // Message header
+    $this->assertNotNull($ddex->getMessageHeader());
+    $this->assertEquals("Deprecated", $ddex->getMessageHeader()->getMessageThreadId());
+    $this->assertEquals("PADPIDA200903020155894108416015858863643750032", $ddex->getMessageHeader()->getMessageId());
+    $this->assertEquals("PADPIDA20090302015", $ddex->getMessageHeader()->getMessageSender()->getPartyId()[0]->value());
+    $this->assertEquals("Consolidated Independent Ltd", $ddex->getMessageHeader()->getMessageSender()->getPartyName()->getFullName()->value());
+    $this->assertEquals("PADPIDA2013020801K", $ddex->getMessageHeader()->getMessageRecipient()[0]->getPartyId()[0]->value());
+    $this->assertEquals("Sauce Industries llc. dba Gray V", $ddex->getMessageHeader()->getMessageRecipient()[0]->getPartyName()->getFullName()->value());
+    $this->assertEquals("2019-11-08T20:14:13+00:00", $ddex->getMessageHeader()->getMessageCreatedDateTime()->format("Y-m-d\TH:i:sP"));
+
+    // UpdateIndicator
+    $this->assertEquals("OriginalMessage", $ddex->getUpdateIndicator());
+
+    // Resources - SoundRecording
+    $this->assertNotNull($ddex->getResourceList());
+    $this->assertCount(1, $ddex->getResourceList()->getSoundRecording());
+    /* @var $sound_recording Ern32SoundRecordingType */
+    $sound_recording = $ddex->getResourceList()->getSoundRecording()[0];
+    $this->assertEquals("GBCVZ1900196", $sound_recording->getSoundRecordingId()[0]->getIsrc());
+    $this->assertEquals("A58863644450088", $sound_recording->getResourceReference());
+    $this->assertEquals("Bloodbuzz Ohio", $sound_recording->getReferenceTitle()->getTitleText());
+    $this->assertEquals("PT00H04M39S", $sound_recording->getDuration()->format("PT%iH%iM%sS"));
+
+    // SoundRecordingDetailsByTerritory
+    $this->assertCount(1, $sound_recording->getSoundRecordingDetailsByTerritory());
+    $srdbt = $sound_recording->getSoundRecordingDetailsByTerritory()[0];
+    $this->assertEquals("Worldwide", $srdbt->getTerritoryCode()[0]);
+    $this->assertEquals("SOAK", $srdbt->getDisplayArtist()[0]->getPartyName()[0]->getFullName()->value());
+    $this->assertEquals("MainArtist", $srdbt->getDisplayArtist()[0]->getArtistRole()[0]);
+
+    // Resources - Image
+    $this->assertCount(1, $ddex->getResourceList()->getImage());
+    $image = $ddex->getResourceList()->getImage()[0];
+    $this->assertEquals("FrontCoverImage", $image->getImageType());
+    $this->assertEquals("A58863643320054", $image->getResourceReference());
+
+    // Releases
+    $this->assertNotNull($ddex->getReleaseList());
+    $this->assertCount(2, $ddex->getReleaseList()->getRelease());
+
+    // First release (TrackRelease)
+    /* @var $track_release Ern32ReleaseType */
+    $track_release = $ddex->getReleaseList()->getRelease()[0];
+    $this->assertEquals("GBCVZ1900196", $track_release->getReleaseId()[0]->getIsrc());
+    $this->assertEquals("R58863644450088", $track_release->getReleaseReference()[0]);
+    $this->assertEquals("TrackRelease", $track_release->getReleaseType());
+
+    // Second release (Single/Album)
+    /* @var $album_release Ern32ReleaseType */
+    $album_release = $ddex->getReleaseList()->getRelease()[1];
+    $this->assertEquals("191402011555", $album_release->getReleaseId()[0]->getIcpn());
+    $this->assertEquals("R58863643750032", $album_release->getReleaseReference()[0]);
+    $this->assertEquals("Single", $album_release->getReleaseType());
+    $this->assertEquals("Bloodbuzz Ohio", $album_release->getReferenceTitle()->getTitleText());
+
+    // DealList
+    $this->assertNotNull($ddex->getDealList());
+    $this->assertCount(3, $ddex->getDealList()->getReleaseDeal());
+    
+    // Check first deal
+    $deal = $ddex->getDealList()->getReleaseDeal()[0];
+    $this->assertEquals("R58863643750032", $deal->getDealReleaseReference());
+    $this->assertEquals("Download", $deal->getDeal()->getDealTerms()->getUsage()[0]->getUseType());
+    $this->assertGreaterThan(200, count($deal->getDeal()->getDealTerms()->getTerritoryCode())); // Worldwide territories
+  }
+
+  /**
+   * Test ERN-Main 32 EP with multiple tracks is parsed correctly
+   */
+  public function testSample019Ern32Ep() {
+    $xml_path = "tests/samples/019_ern32_ep.xml";
+    $parser_controller = new ErnParserController();
+    $parser_controller->setDisplayLog(false);
+    /* @var $ddex Ern32NewReleaseMessage */
+    $ddex = $parser_controller->parse($xml_path);
+
+    // ERN-Main 32 should use classes with namespace Ern32
+    $this->assertEquals('DedexBundle\Entity\Ern32\NewReleaseMessage', get_class($ddex));
+
+    // ERN attributes
+    $this->assertEquals("2010/ern-main/32", $ddex->getMessageSchemaVersionId());
+
+    // Resources - should have 3 sound recordings
+    $this->assertNotNull($ddex->getResourceList());
+    $this->assertCount(3, $ddex->getResourceList()->getSoundRecording());
+
+    // Check first sound recording
+    $sound_recording = $ddex->getResourceList()->getSoundRecording()[0];
+    $this->assertEquals("GBCVZ1900192", $sound_recording->getSoundRecordingId()[0]->getIsrc());
+    $this->assertEquals("John Joe Reilly", $sound_recording->getReferenceTitle()->getTitleText());
+
+    // Check second sound recording
+    $sound_recording2 = $ddex->getResourceList()->getSoundRecording()[1];
+    $this->assertEquals("GBCVZ1900198", $sound_recording2->getSoundRecordingId()[0]->getIsrc());
+    $this->assertEquals("Come Back Paddy Reilly to Ballyjamesduff", $sound_recording2->getReferenceTitle()->getTitleText());
+
+    // Check third sound recording
+    $sound_recording3 = $ddex->getResourceList()->getSoundRecording()[2];
+    $this->assertEquals("GBCVZ1900193", $sound_recording3->getSoundRecordingId()[0]->getIsrc());
+    $this->assertEquals("The Wren, The Wren", $sound_recording3->getReferenceTitle()->getTitleText());
+
+    // Releases - should have 4 releases (3 track releases + 1 album release)
+    $this->assertNotNull($ddex->getReleaseList());
+    $this->assertCount(4, $ddex->getReleaseList()->getRelease());
+
+    // Check album release (last one)
+    $album_release = $ddex->getReleaseList()->getRelease()[3];
+    $this->assertEquals("191402800869", $album_release->getReleaseId()[0]->getIcpn());
+    $this->assertEquals("The Wren, The Wren", $album_release->getReferenceTitle()->getTitleText());
+    $this->assertEquals("Album", $album_release->getReleaseType());
+    
+    // Album should reference all 3 sound recordings + image
+    $this->assertCount(4, $album_release->getReleaseResourceReferenceList());
   }
 
 }
