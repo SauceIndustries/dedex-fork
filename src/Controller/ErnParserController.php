@@ -247,14 +247,12 @@ class ErnParserController {
       return;
     }
 
+    // Strip namespace prefixes from tag names to ensure correct setter/getter method discovery
+    $name = $this->stripNamespacePrefix($name);
+
     // Create element here. But to know its type, call its parent getter if any.
     // There is only one case when there is no parent: NewReleaseMessage or PurgeReleaseMessage.
-    if ($name === "ern:NewReleaseMessage" || $name === "ernm:NewReleaseMessage") {
-      $name = "NewReleaseMessage";
-      $class_name = "DedexBundle\\Entity\\Ern{$this->version}\\$name";
-      $this->ern = new $class_name();
-    } else if ($name === "ern:PurgeReleaseMessage" || $name === "ernm:PurgeReleaseMessage") {
-      $name = "PurgeReleaseMessage";
+    if ($name === "NewReleaseMessage" || $name === "PurgeReleaseMessage") {
       $class_name = "DedexBundle\\Entity\\Ern{$this->version}\\$name";
       $this->ern = new $class_name();
     } else {
@@ -350,6 +348,9 @@ class ErnParserController {
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
       return;
     }
+
+    // Strip namespace prefixes from tag names to ensure correct setter/getter method discovery
+    $name = $this->stripNamespacePrefix($name);
 
     // Special handling for nested <Extent> elements
     if ($this->handling_nested_extent && $name === "Extent") {
@@ -481,6 +482,22 @@ class ErnParserController {
    */
   public function cleanTag($tag) {
     return str_replace(":", "_", $tag);
+  }
+
+  /**
+   * Strip namespace prefixes from XML tag names (e.g., "ern:ReferenceTitle" -> "ReferenceTitle").
+   * This ensures we can find the correct setter/getter methods in the entity classes,
+   * which don't use namespace prefixes in their method names.
+   *
+   * @param string $tagName The tag name that may contain a namespace prefix
+   * @return string The tag name without the namespace prefix
+   */
+  private function stripNamespacePrefix(string $tagName): string {
+    if (strpos($tagName, ":") !== false) {
+      $parts = explode(":", $tagName, 2);
+      return $parts[1]; // Return the part after the colon
+    }
+    return $tagName;
   }
 
   /**
