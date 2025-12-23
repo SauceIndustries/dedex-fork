@@ -146,6 +146,13 @@ class ErnParserController {
   private $lastElement = [];
 
   /**
+   * Tracks when we're inside a list container that uses addTo* methods.
+   * Format: ['listTag' => 'InstantGratificationResourceList', 'parent' => $parentObject]
+   * @var array|null
+   */
+  private $current_list_context = null;
+
+  /**
    * Log something (will echo if display_log is true)
    * @param type $message
    */
@@ -273,9 +280,79 @@ class ErnParserController {
         return; // Don't create a new object, we'll handle this specially
       }
 
-      $class_name = $this->getTypeOfElementFromDoc($parent_class, $name);
+      // If we're inside a list context, handle child elements specially
+      if ($this->current_list_context !== null) {
+        // This is a child element of a list (like DealResourceReference inside InstantGratificationResourceList)
+        // Don't create an object or set set_to_parent - the value will be handled directly
+        // in setCurrentElement using the list context's addTo* method
+        return; // Don't create an object, we'll handle the value in setCurrentElement
+      }
+
+      // Try to find the correct parent class by searching backwards through the pile
+      // This handles cases where the immediate parent might not have the method
+      // (e.g., TechnicalDetails should be on SoundRecording, not ResourceList)
+      $func_names = $this->listPossibleFunctionNames("get", $name);
+      $found_parent_class = $parent_class;
+      $found = false;
+      
+      // Check if the immediate parent has the method
+      foreach ($func_names as $func_name) {
+        if (method_exists($parent_class, $func_name)) {
+          $found = true;
+          break;
+        }
+      }
+      
+      // If not found, search backwards through the pile
+      if (!$found && count($this->pile) > 1) {
+        $pile_keys = array_keys($this->pile);
+        for ($i = count($pile_keys) - 2; $i >= 0; $i--) {
+          $candidate = $this->pile[$pile_keys[$i]];
+          $candidate_class = get_class($candidate);
+          foreach ($func_names as $func_name) {
+            if (method_exists($candidate_class, $func_name)) {
+              $found_parent_class = $candidate_class;
+              $found = true;
+              break 2;
+            }
+          }
+        }
+      }
+
+      $class_name = $this->getTypeOfElementFromDoc($found_parent_class, $name);
 
       if (!class_exists($class_name)) {
+        // Check if this is a list container (array type) that uses addTo* methods
+        // This pattern is used in ERN 41, 43, and 411 for elements like InstantGratificationResourceList
+        // which are defined as array<string> with xml_list inline: false
+        // Other ERN versions (32, 371, 381, 382, 383) use class types (e.g. DealResourceReferenceListType)
+        // so class_exists() will return true for them and this code won't execute
+        $add_to_method = "addTo" . $name;
+        
+        // Use the found parent (which has the method) instead of the immediate parent
+        $found_parent = null;
+        if ($found_parent_class !== $parent_class) {
+          // Find the actual object with the found parent class
+          $pile_keys = array_keys($this->pile);
+          for ($i = count($pile_keys) - 1; $i >= 0; $i--) {
+            if (get_class($this->pile[$pile_keys[$i]]) === $found_parent_class) {
+              $found_parent = $this->pile[$pile_keys[$i]];
+              break;
+            }
+          }
+        }
+        $parent_to_check = $found_parent !== null ? $found_parent : $parent;
+        
+        if (method_exists($parent_to_check, $add_to_method)) {
+          // This is a list container, set up the context
+          $this->current_list_context = [
+            'listTag' => $name,
+            'parent' => $parent_to_check,
+            'addToMethod' => $add_to_method
+          ];
+          return; // Don't create an object, we'll handle entries directly
+        }
+        
         // Set element to parent class
         $this->set_to_parent = true;
         $this->set_to_parent_tag = $name;
@@ -382,12 +459,28 @@ class ErnParserController {
       }
     }
 
+    // Special handling for child elements inside list contexts (like DealResourceReference inside InstantGratificationResourceList)
+    // These elements are not added to the pile, so we just return early
+    if ($this->current_list_context !== null && $name !== $this->current_list_context['listTag']) {
+      // This is a child element of the list, not the list itself
+      // The value was already handled in setCurrentElement, so just return
+      return;
+    }
+
     $properties = array_filter(array_values((array) end($this->pile)));
-    if (count($properties) == 0 && !$this->set_to_parent) {
+    // Only remove empty elements if they are list containers (end with "List" or are known list types)
+    // Don't remove resource elements like SoundRecording, Image, etc. even if they appear empty,
+    // as they may have child elements that haven't been processed yet
+    $is_list_container = (substr($name, -4) === "List") || 
+                         (substr($name, -13) === "ReferenceList") ||
+                         (substr($name, -8) === "ListType");
+    
+    if (count($properties) == 0 && !$this->set_to_parent && $is_list_container) {
       // If we are leaving an element that is completely empty (the object
       // at the end of the pile, converted to an array, only contains emtpy
       // values), then to not add this element to parent. It's an empty List
       // element in DDEX, like ReleaseResourceReferenceList
+      // Only do this for list containers, not for resource elements
       array_pop($this->pile);
     } else if (!$this->set_to_parent) {
       // Process attributes now.
@@ -418,6 +511,11 @@ class ErnParserController {
     // Reset parent setting
     $this->set_to_parent = false;
     $this->set_to_parent_tag = "";
+
+    // Reset list context if we're leaving the list element
+    if ($this->current_list_context !== null && $name === $this->current_list_context['listTag']) {
+      $this->current_list_context = null;
+    }
 
     // Reset last element
     $this->lastElement = [];
@@ -549,6 +647,19 @@ class ErnParserController {
    * @param string $value Value to set
    */
   private function setCurrentElement($value) {
+    // Check if we're inside a list context that uses addTo* methods
+    if ($this->current_list_context !== null) {
+      $value_clean = trim($value);
+      if ($value_clean !== "") {
+        $this->log($value_clean . ": " . implode("->", array_keys($this->pile)) . " (adding to " . $this->current_list_context['listTag'] . ")");
+        // Use the addTo* method directly
+        $add_to_method = $this->current_list_context['addToMethod'];
+        $parent = $this->current_list_context['parent'];
+        $parent->$add_to_method($value_clean);
+      }
+      return;
+    }
+
     // Use last element in pile
     $keys = array_keys($this->pile);
 
@@ -646,9 +757,27 @@ class ErnParserController {
    * @return string
    */
   private function getTypeOfElementFromDoc($class, $tag) {
-    [$function_name, $class] = $this->getValidFunctionName("get", $tag);
+    // First, try to find the method on the provided parent class
+    // This is important for maintaining context when the parent might not be at the end of the pile
+    $func_names = $this->listPossibleFunctionNames("get", $tag);
+    $function_name = null;
+    $found_class = null;
+    
+    // Check the provided parent class first
+    foreach ($func_names as $func_name) {
+      if (method_exists($class, $func_name)) {
+        $found_class = $class;
+        $function_name = $func_name;
+        break;
+      }
+    }
+    
+    // If not found on the provided class, search through the pile (backward compatibility)
+    if ($function_name === null) {
+      [$function_name, $found_class] = $this->getValidFunctionName("get", $tag);
+    }
 
-    $rc = new ReflectionMethod($class, $function_name);
+    $rc = new ReflectionMethod($found_class, $function_name);
     $doc = $rc->getDocComment();
     preg_match("/@return (\S+).*/", $doc, $matches);
     if (count($matches) > 1) {
