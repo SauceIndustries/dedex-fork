@@ -93,10 +93,11 @@ class ErnParserController {
   private $ern = null;
 
   /**
-   * key=tag_name and value=current element (object)
-   * @var type
+   * Stack of elements being parsed. Each entry is ['tag' => string, 'element' => object]
+   * Maintains insertion order for reliable LIFO operations
+   * @var array
    */
-  private $pile = array();
+  private $pile = [];
 
   /**
    * Contains a list of ids (spl_object_id) of objects that had a closed
@@ -105,6 +106,13 @@ class ErnParserController {
    * @var array
    */
   private $closed_objects = [];
+
+  /**
+   * The path of the file being parsed
+   * @var string
+   */
+  private $file_path = null;
+
 
   /**
    * If true, display logs (for debugging purpose mainly)
@@ -146,11 +154,21 @@ class ErnParserController {
   private $lastElement = [];
 
   /**
+   * Tracks when we're inside a list container that uses addTo* methods.
+   * Format: ['listTag' => 'InstantGratificationResourceList', 'parent' => $parentObject]
+   * @var array|null
+   */
+  private $current_list_context = null;
+
+  /**
    * Log something (will echo if display_log is true)
    * @param type $message
    */
   private function log($message) {
     if ($this->display_log) {
+      // Use error_log so it goes to PHP error log (works in both CLI and web contexts)
+      error_log($message);
+      // Also echo for CLI compatibility
       echo $message . "\n";
     }
   }
@@ -239,26 +257,30 @@ class ErnParserController {
    * Function called when the parser encounters a tag opening
    *
    * @param type $parser
-   * @param string $name The name of the tag
+   * @param string $name The name of the tag (may contain namespace prefix)
    * @param array $attrs The attributes of the tag
    */
   private function callbackStartElement($parser, string $name, array $attrs) {
+    // Check ignore list first (contains attribute names like "xmlns:ern" that should not be normalized)
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
       return;
     }
 
+    // Strip namespace prefix from tag name (e.g., "ern:NewReleaseMessage" -> "NewReleaseMessage")
+    // This normalizes all tag names consistently, not just root elements
+    $name = $this->stripNamespacePrefix($name);
+
     // Create element here. But to know its type, call its parent getter if any.
     // There is only one case when there is no parent: NewReleaseMessage or PurgeReleaseMessage.
-    if ($name === "ern:NewReleaseMessage" || $name === "ernm:NewReleaseMessage") {
-      $name = "NewReleaseMessage";
-      $class_name = "DedexBundle\\Entity\\Ern{$this->version}\\$name";
-      $this->ern = new $class_name();
-    } else if ($name === "ern:PurgeReleaseMessage" || $name === "ernm:PurgeReleaseMessage") {
-      $name = "PurgeReleaseMessage";
+    if ($name === "NewReleaseMessage" || $name === "PurgeReleaseMessage") {
       $class_name = "DedexBundle\\Entity\\Ern{$this->version}\\$name";
       $this->ern = new $class_name();
     } else {
-      $parent = end($this->pile);
+      $parent = $this->getLastPileElement();
+      if ($parent === null) {
+        // This shouldn't happen, but handle gracefully
+        throw new Exception("No parent element found in pile for tag: $name");
+      }
       $parent_class = get_class($parent);
 
       // Special handling for incorrectly nested <Extent> elements inside ExtentType
@@ -273,9 +295,77 @@ class ErnParserController {
         return; // Don't create a new object, we'll handle this specially
       }
 
-      $class_name = $this->getTypeOfElementFromDoc($parent_class, $name);
+      // If we're inside a list context, handle child elements specially
+      if ($this->current_list_context !== null) {
+        // This is a child element of a list (like DealResourceReference inside InstantGratificationResourceList)
+        // Don't create an object or set set_to_parent - the value will be handled directly
+        // in setCurrentElement using the list context's addTo* method
+        return; // Don't create an object, we'll handle the value in setCurrentElement
+      }
+
+      // Try to find the correct parent class by searching backwards through the pile
+      // This handles cases where the immediate parent might not have the method
+      // (e.g., TechnicalDetails should be on SoundRecording, not ResourceList)
+      $func_names = $this->listPossibleFunctionNames("get", $name);
+      $found_parent_class = $parent_class;
+      $found = false;
+      
+      // Check if the immediate parent has the method
+      foreach ($func_names as $func_name) {
+        if (method_exists($parent_class, $func_name)) {
+          $found = true;
+          break;
+        }
+      }
+      
+      // If not found, search backwards through the pile
+      if (!$found && count($this->pile) > 1) {
+        for ($i = count($this->pile) - 2; $i >= 0; $i--) {
+          $candidate = $this->pile[$i]['element'];
+          $candidate_class = get_class($candidate);
+          foreach ($func_names as $func_name) {
+            if (method_exists($candidate_class, $func_name)) {
+              $found_parent_class = $candidate_class;
+              $found = true;
+              break 2;
+            }
+          }
+        }
+      }
+
+      $class_name = $this->getTypeOfElementFromDoc($found_parent_class, $name);
 
       if (!class_exists($class_name)) {
+        // Check if this is a list container (array type) that uses addTo* methods
+        // This pattern is used in ERN 41, 43, and 411 for elements like InstantGratificationResourceList
+        // which are defined as array<string> with xml_list inline: false
+        // Other ERN versions (32, 371, 381, 382, 383) use class types (e.g. DealResourceReferenceListType)
+        // so class_exists() will return true for them and this code won't execute
+        $add_to_method = "addTo" . $name;
+        
+        // Use the found parent (which has the method) instead of the immediate parent
+        $found_parent = null;
+        if ($found_parent_class !== $parent_class) {
+          // Find the actual object with the found parent class
+          for ($i = count($this->pile) - 1; $i >= 0; $i--) {
+            if (get_class($this->pile[$i]['element']) === $found_parent_class) {
+              $found_parent = $this->pile[$i]['element'];
+              break;
+            }
+          }
+        }
+        $parent_to_check = $found_parent !== null ? $found_parent : $parent;
+        
+        if (method_exists($parent_to_check, $add_to_method)) {
+          // This is a list container, set up the context
+          $this->current_list_context = [
+            'listTag' => $name,
+            'parent' => $parent_to_check,
+            'addToMethod' => $add_to_method
+          ];
+          return; // Don't create an object, we'll handle entries directly
+        }
+        
         // Set element to parent class
         $this->set_to_parent = true;
         $this->set_to_parent_tag = $name;
@@ -284,12 +374,8 @@ class ErnParserController {
     }
     $elem = $this->instanciateClass($class_name);
 
-    // Tags can have the same names in the hierarchy (like ResourceGroup)
-    if (!array_key_exists($name, $this->pile)) {
-      $this->pile[$name] = $elem;
-    } else {
-      $this->pile[$name . "##" . random_int(2, 99999)] = $elem;
-    }
+    // Push element to stack (no need to check for duplicates - stack handles them naturally)
+    array_push($this->pile, ['tag' => $name, 'element' => $elem]);
 
     // Will process attributes later
     $this->attrs_to_process[count($this->pile)] = $attrs;
@@ -344,12 +430,16 @@ class ErnParserController {
    * to its parent. Will delete this element (contained in the parent now).
    *
    * @param type $parser
-   * @param string $name
+   * @param string $name The name of the tag (may contain namespace prefix)
    */
   private function callbackEndElement($parser, string $name) {
+    // Check ignore list first (contains attribute names like "xmlns:ern" that should not be normalized)
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
       return;
     }
+
+    // Strip namespace prefix from tag name for consistency
+    $name = $this->stripNamespacePrefix($name);
 
     // Special handling for nested <Extent> elements
     if ($this->handling_nested_extent && $name === "Extent") {
@@ -360,7 +450,7 @@ class ErnParserController {
       $this->nested_extent_unit_of_measure = null;
       $this->nested_extent_value = "";
       
-      $parent = end($this->pile);
+      $parent = $this->getLastPileElement();
       if ($parent && $this->isExtentType(get_class($parent))) {
         // Set the accumulated value on the ExtentType parent
         $value_clean = trim($accumulated_value);
@@ -382,12 +472,36 @@ class ErnParserController {
       }
     }
 
-    $properties = array_filter(array_values((array) end($this->pile)));
-    if (count($properties) == 0 && !$this->set_to_parent) {
+    // Special handling for elements inside list contexts (like DealResourceReference inside InstantGratificationResourceList)
+    // List containers themselves are not added to the pile, so we need special handling
+    if ($this->current_list_context !== null) {
+      if ($name === $this->current_list_context['listTag']) {
+        // This is the list container element itself ending
+        // It was never added to the pile, so just reset the context and return
+        $this->current_list_context = null;
+        return;
+      } else {
+        // This is a child element of the list, not the list itself
+        // The value was already handled in setCurrentElement, so just return
+        return;
+      }
+    }
+
+    $last_element = $this->getLastPileElement();
+    $properties = $last_element ? array_filter(array_values((array) $last_element)) : [];
+    // Only remove empty elements if they are list containers (end with "List" or are known list types)
+    // Don't remove resource elements like SoundRecording, Image, etc. even if they appear empty,
+    // as they may have child elements that haven't been processed yet
+    $is_list_container = (substr($name, -4) === "List") || 
+                         (substr($name, -13) === "ReferenceList") ||
+                         (substr($name, -8) === "ListType");
+    
+    if (count($properties) == 0 && !$this->set_to_parent && $is_list_container) {
       // If we are leaving an element that is completely empty (the object
       // at the end of the pile, converted to an array, only contains emtpy
       // values), then to not add this element to parent. It's an empty List
       // element in DDEX, like ReleaseResourceReferenceList
+      // Only do this for list containers, not for resource elements
       array_pop($this->pile);
     } else if (!$this->set_to_parent) {
       // Process attributes now.
@@ -418,6 +532,8 @@ class ErnParserController {
     // Reset parent setting
     $this->set_to_parent = false;
     $this->set_to_parent_tag = "";
+
+    // Note: List context is now reset earlier when the list element ends (see above)
 
     // Reset last element
     $this->lastElement = [];
@@ -459,17 +575,109 @@ class ErnParserController {
   private function attachToParent() {
     if (count($this->pile) < 2) {
       // We are done, attach it to $this->ern
-      $this->ern = end($this->pile);
+      $this->ern = $this->getLastPileElement();
       return;
     }
 
-    $keys = array_keys($this->pile);
-    $child_tag = end($keys);
-    $child = $this->pile[$child_tag];
+    $last_entry = $this->getLastPileEntry();
+    $child_tag = $last_entry['tag'];
+    $child = $last_entry['element'];
 
-    [$func_name, $parent] = $this->getValidFunctionName("set", $child_tag, $child);
+    // Check if we should use addTo* (for lists) or set* (for single values)
+    // If set* expects an array, use addTo* instead
+    $func_names = $this->listPossibleFunctionNames("set", $child_tag);
+    $parent = $this->pile[count($this->pile) - 2]['element'];
+    $func_name = null;
+    
+    // First, try set* methods, but check if they expect arrays
+    foreach ($func_names as $candidate_func) {
+      if (strpos($candidate_func, "addTo") === 0) {
+        continue; // Skip addTo* methods for now
+      }
+      if (method_exists($parent, $candidate_func)) {
+        // Check if this set* method expects an array - if so, skip it and use addTo* instead
+        if ($this->expectedParamIsArray($parent, $candidate_func)) {
+          continue; // This is a list setter, use addTo* instead
+        }
+        $func_name = $candidate_func;
+        break;
+      }
+    }
+    
+    // If no single-value set* method found, try addTo* methods (for list elements)
+    if ($func_name === null) {
+      foreach ($func_names as $candidate_func) {
+        if (strpos($candidate_func, "addTo") === 0 && method_exists($parent, $candidate_func)) {
+          $func_name = $candidate_func;
+          break;
+        }
+      }
+    }
+    
+    // If still no method found, fall back to original behavior
+    if ($func_name === null) {
+      [$func_name, $parent] = $this->getValidFunctionName("set", $child_tag, $child);
+    }
 
     $parent->$func_name($child);
+  }
+
+  /**
+   * Strip namespace prefix from tag name (e.g., "ern:NewReleaseMessage" -> "NewReleaseMessage")
+   * 
+   * @param string $tag Tag name that may contain namespace prefix
+   * @return string Tag name without namespace prefix
+   */
+  private function stripNamespacePrefix(string $tag): string {
+    // Remove common namespace prefixes (ern:, ernm:, etc.)
+    // Pattern: any word characters followed by colon at the start
+    if (preg_match('/^[a-zA-Z0-9_]+:(.+)$/', $tag, $matches)) {
+      return $matches[1];
+    }
+    return $tag;
+  }
+
+  /**
+   * Get the last entry from the pile stack
+   * @return array|null ['tag' => string, 'element' => object] or null if empty
+   */
+  private function getLastPileEntry() {
+    if (empty($this->pile)) {
+      return null;
+    }
+    return end($this->pile);
+  }
+
+  /**
+   * Get the last element from the pile stack
+   * @return object|null The last element object or null if empty
+   */
+  private function getLastPileElement() {
+    $entry = $this->getLastPileEntry();
+    return $entry ? $entry['element'] : null;
+  }
+
+  /**
+   * Get the last tag name from the pile stack
+   * @return string|null The last tag name or null if empty
+   */
+  private function getLastPileTag() {
+    $entry = $this->getLastPileEntry();
+    return $entry ? $entry['tag'] : null;
+  }
+
+  /**
+   * Find an element in the pile by tag name, searching backwards from the end
+   * @param string $tag The tag name to search for
+   * @return object|null The element object or null if not found
+   */
+  private function findInPile(string $tag) {
+    for ($i = count($this->pile) - 1; $i >= 0; $i--) {
+      if ($this->pile[$i]['tag'] === $tag) {
+        return $this->pile[$i]['element'];
+      }
+    }
+    return null;
   }
 
   /**
@@ -549,15 +757,35 @@ class ErnParserController {
    * @param string $value Value to set
    */
   private function setCurrentElement($value) {
+    // Check if we're inside a list context that uses addTo* methods
+    if ($this->current_list_context !== null) {
+      $value_clean = trim($value);
+      if ($value_clean !== "") {
+        $pile_tags = array_column($this->pile, 'tag');
+        $this->log($value_clean . ": " . implode("->", $pile_tags) . " (adding to " . $this->current_list_context['listTag'] . ")");
+        // Use the addTo* method directly
+        $add_to_method = $this->current_list_context['addToMethod'];
+        $parent = $this->current_list_context['parent'];
+        $parent->$add_to_method($value_clean);
+      }
+      return;
+    }
+
     // Use last element in pile
-    $keys = array_keys($this->pile);
+    $pile_count = count($this->pile);
 
     if ($this->set_to_parent) {
-      $elem = end($this->pile);
+      $elem = $this->getLastPileElement();
       $tag = $this->set_to_parent_tag;
     } else {
-      $elem = $this->pile[$keys[count($keys) - 2]];
-      $tag = end($keys);
+      // Get parent element (second-to-last) and current tag (last)
+      if ($pile_count >= 2) {
+        $elem = $this->pile[$pile_count - 2]['element'];
+        $tag = $this->getLastPileTag();
+      } else {
+        $elem = $this->getLastPileElement();
+        $tag = $this->getLastPileTag();
+      }
     }
     // If the previous element was the same and had the same tag, concatenate value
     // xml_parser is known to split values when encountering multibyte chars and call the character_data_handler multiple times
@@ -565,7 +793,8 @@ class ErnParserController {
       $value = $this->lastElement[2] . $value;
     }
     $value_clean = trim($value);
-    $this->log($value_clean . ": " . implode("->", array_keys($this->pile)));
+    $pile_tags = array_column($this->pile, 'tag');
+    $this->log($value_clean . ": " . implode("->", $pile_tags));
     [$func_name, $elem] = $this->getValidFunctionName("set", $tag, $elem);
 
     // It's possible we're trying to set a text but it's expecting an
@@ -577,7 +806,11 @@ class ErnParserController {
     if ($this->set_to_parent) {
       $elem->$func_name($value_inst);
     } else {
-      $this->pile[$tag] = $value_inst;
+      // Update the last element in the stack
+      $last_index = count($this->pile) - 1;
+      if ($last_index >= 0) {
+        $this->pile[$last_index]['element'] = $value_inst;
+      }
     }
   }
 
@@ -594,32 +827,48 @@ class ErnParserController {
   private function getValidFunctionName($prefix, $tag, $value = null) {
     $func_names = $this->listPossibleFunctionNames($prefix, $tag);
 
-    $elem = end($this->pile);
+    $pile_count = count($this->pile);
+    $start_index = $pile_count - 1;
 
     // If type is complex, always start at previous than end,
     // as end will be itself
-    if ($value != null && !$this->set_to_parent && !in_array(get_class($value), ["string", "int", "bool", "float", "mixed"])) {
-      $elem = prev($this->pile);
+    if ($value != null && !$this->set_to_parent && is_object($value) && !in_array(get_class($value), ["string", "int", "bool", "float", "mixed"])) {
+      $start_index = $pile_count - 2;
     }
 
-    while (true) {
+    $i = $start_index;
+    while ($i >= 0) {
+      // Safety check: ensure pile entry exists and has element
+      if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
+        $i--;
+        continue;
+      }
+      
+      $elem = $this->pile[$i]['element'];
+      
+      // Safety check: ensure element is an object
+      if (!is_object($elem)) {
+        $i--;
+        continue;
+      }
+      
       $function_used = false;
       foreach ($func_names as $func_name) {
         if (!method_exists($elem, $func_name)) {
           continue;
         }
         $function_used = true;
-        break 2;
+        return array($func_name, $elem);
       }
 
       // Continue with previous element if exists
-      $elem = prev($this->pile);
-      if ($elem === false) {
-        throw new Exception("No functions found for this tag: $tag. Path is " . implode(",", array_keys($this->pile)));
-      }
+      $i--;
     }
 
-    return array($func_name, $elem);
+    // No function found
+    $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
+    $pile_tags = array_column($this->pile, 'tag');
+    throw new Exception("No functions found for this tag: $tag. Path is " . implode(",", $pile_tags) . $fileInfo);
   }
 
   private function expectedParamIsArray($class, $func_name) {
@@ -646,9 +895,27 @@ class ErnParserController {
    * @return string
    */
   private function getTypeOfElementFromDoc($class, $tag) {
-    [$function_name, $class] = $this->getValidFunctionName("get", $tag);
+    // First, try to find the method on the provided parent class
+    // This is important for maintaining context when the parent might not be at the end of the pile
+    $func_names = $this->listPossibleFunctionNames("get", $tag);
+    $function_name = null;
+    $found_class = null;
+    
+    // Check the provided parent class first
+    foreach ($func_names as $func_name) {
+      if (method_exists($class, $func_name)) {
+        $found_class = $class;
+        $function_name = $func_name;
+        break;
+      }
+    }
+    
+    // If not found on the provided class, search through the pile (backward compatibility)
+    if ($function_name === null) {
+      [$function_name, $found_class] = $this->getValidFunctionName("get", $tag);
+    }
 
-    $rc = new ReflectionMethod($class, $function_name);
+    $rc = new ReflectionMethod($found_class, $function_name);
     $doc = $rc->getDocComment();
     preg_match("/@return (\S+).*/", $doc, $matches);
     if (count($matches) > 1) {
@@ -695,9 +962,34 @@ class ErnParserController {
       // Remove milliseconds if any
       $value_default = $value_default ?? '0000-00-00T00:00:00';
       $value = preg_replace("/\.\d+\+/", "+", $value_default);
+      
+      // Handle UTC timezone indicator (Z) - convert to +00:00 format
+      if (substr($value, -1) === 'Z') {
+        $value = substr($value, 0, -1) . '+00:00';
+      }
+      
       // Support both ATOM or regular datetime format
       $format = (mb_strlen($value) > mb_strlen('0000-00-00T00:00:00')) ? "Y-m-d\TH:i:sP" : "Y-m-d\TH:i:s";
       $new_elem = DateTime::createFromFormat($format, $value);
+      
+      // If createFromFormat fails, try alternative formats
+      if ($new_elem === false) {
+        // Try ISO 8601 format with timezone
+        $new_elem = DateTime::createFromFormat(DateTime::ATOM, $value_default);
+      }
+      if ($new_elem === false) {
+        // Try ISO 8601 format without timezone
+        $new_elem = DateTime::createFromFormat("Y-m-d\TH:i:s", $value);
+      }
+      if ($new_elem === false) {
+        // Last resort: try standard DateTime constructor
+        try {
+          $new_elem = new DateTime($value_default);
+        } catch (\Exception $e) {
+          // Return a default DateTime instead of false
+          $new_elem = new DateTime('1970-01-01T00:00:00');
+        }
+      }
     } elseif ($type == "\DateInterval") {
         // Check for ISO8601:2004 format
         preg_match('/^P(?:(\d+D))?(T(?:(\d+H))?(?:(\d+M))?(?:(\d+(?:\.\d+)?S))?)?$/i', $value_default, $matches);
@@ -947,9 +1239,10 @@ class ErnParserController {
    *
    * @param string $file_path Location of XML path
    * @return Ddex The main entity modelling the full DDex file
-   * @throws Exception If file not found or XML can't be loaded
    */
   public function parse(string $file_path) {
+    $this->file_path = $file_path;
+
     if (!file_exists($file_path)) {
       throw new FileNotFoundException("File not found: $file_path");
     }
