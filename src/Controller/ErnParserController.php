@@ -959,6 +959,10 @@ class ErnParserController {
     $type = $matches[1];
     $this->log("create type $type");
     if ($type == "\DateTime") {
+      // Check if the parameter is required (not nullable, no default value)
+      $param = $rc->getParameters()[0];
+      $is_required = !$param->allowsNull() && !$param->isDefaultValueAvailable();
+      
       // Remove milliseconds if any
       $value_default = $value_default ?? '0000-00-00T00:00:00';
       $value = preg_replace("/\.\d+\+/", "+", $value_default);
@@ -986,7 +990,12 @@ class ErnParserController {
         try {
           $new_elem = new DateTime($value_default);
         } catch (\Exception $e) {
-          // Return a default DateTime instead of false
+          // If required, throw error; otherwise return default
+          if ($is_required) {
+            $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
+            throw new Exception("Failed to parse required DateTime value: '$value_default' for method $class::$function" . $fileInfo);
+          }
+          // Return a default DateTime for optional fields
           $new_elem = new DateTime('1970-01-01T00:00:00');
         }
       }
