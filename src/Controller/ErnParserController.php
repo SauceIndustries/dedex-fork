@@ -113,6 +113,35 @@ class ErnParserController {
    */
   private $file_path = null;
 
+  /**
+   * Cache for method_exists results: [class::method => bool]
+   * @var array
+   */
+  private $method_exists_cache = [];
+
+  /**
+   * Cache for ReflectionMethod instances: [class::method => ReflectionMethod]
+   * @var array
+   */
+  private $reflection_cache = [];
+
+  /**
+   * Cache for normalized tag names: [original => normalized]
+   * @var array
+   */
+  private $namespace_cache = [];
+
+  /**
+   * Cache for type lookups: [class::tag => type]
+   * @var array
+   */
+  private $type_cache = [];
+
+  /**
+   * Cache for function name lists: [prefix::tag => [names]]
+   * @var array
+   */
+  private $function_names_cache = [];
 
   /**
    * If true, display logs (for debugging purpose mainly)
@@ -312,7 +341,7 @@ class ErnParserController {
       
       // Check if the immediate parent has the method
       foreach ($func_names as $func_name) {
-        if (method_exists($parent_class, $func_name)) {
+        if ($this->cachedMethodExists($parent_class, $func_name)) {
           $found = true;
           break;
         }
@@ -324,7 +353,7 @@ class ErnParserController {
           $candidate = $this->pile[$i]['element'];
           $candidate_class = get_class($candidate);
           foreach ($func_names as $func_name) {
-            if (method_exists($candidate_class, $func_name)) {
+            if ($this->cachedMethodExists($candidate_class, $func_name)) {
               $found_parent_class = $candidate_class;
               $found = true;
               break 2;
@@ -356,7 +385,7 @@ class ErnParserController {
         }
         $parent_to_check = $found_parent !== null ? $found_parent : $parent;
         
-        if (method_exists($parent_to_check, $add_to_method)) {
+        if ($this->cachedMethodExists($parent_to_check, $add_to_method)) {
           // This is a list container, set up the context
           $this->current_list_context = [
             'listTag' => $name,
@@ -395,6 +424,9 @@ class ErnParserController {
    * @return DateInterval|\DedexBundle\Controller\class_name
    */
   private function instanciateClass($class_name) {
+    // Safety check: remove any array notation that might have slipped through
+    $class_name = preg_replace("/\[\]/", "", $class_name);
+    
     if ($class_name === "\DateInterval") {
       // For DateInterval can't instanciate with null
       return new DateInterval("PT0M0S");  // will be erased
@@ -583,43 +615,55 @@ class ErnParserController {
     $child_tag = $last_entry['tag'];
     $child = $last_entry['element'];
 
-    // Check if we should use addTo* (for lists) or set* (for single values)
-    // If set* expects an array, use addTo* instead
-    $func_names = $this->listPossibleFunctionNames("set", $child_tag);
-    $parent = $this->pile[count($this->pile) - 2]['element'];
+    // When attaching objects, try addTo* methods first (for list elements)
+    // This matches the old behavior and avoids incorrect set* method usage
+    $pile_count = count($this->pile);
+    $start_index = $pile_count - 2; // Parent is second-to-last
+    
     $func_name = null;
+    $parent = null;
     
-    // First, try set* methods, but check if they expect arrays
-    foreach ($func_names as $candidate_func) {
-      if (strpos($candidate_func, "addTo") === 0) {
-        continue; // Skip addTo* methods for now
+    // First, try addTo* methods (for list elements) by searching backwards through pile
+    $add_to_names = ["addTo" . $child_tag, "addTo" . $child_tag . "List"];
+    for ($i = $start_index; $i >= 0; $i--) {
+      if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
+        continue;
       }
-      if (method_exists($parent, $candidate_func)) {
-        // Check if this set* method expects an array - if so, skip it and use addTo* instead
-        if ($this->expectedParamIsArray($parent, $candidate_func)) {
-          continue; // This is a list setter, use addTo* instead
-        }
-        $func_name = $candidate_func;
-        break;
+      $elem = $this->pile[$i]['element'];
+      if (!is_object($elem)) {
+        continue;
       }
-    }
-    
-    // If no single-value set* method found, try addTo* methods (for list elements)
-    if ($func_name === null) {
-      foreach ($func_names as $candidate_func) {
-        if (strpos($candidate_func, "addTo") === 0 && method_exists($parent, $candidate_func)) {
-          $func_name = $candidate_func;
-          break;
+      foreach ($add_to_names as $add_to_name) {
+        if ($this->cachedMethodExists($elem, $add_to_name)) {
+          $func_name = $add_to_name;
+          $parent = $elem;
+          break 2;
         }
       }
     }
     
-    // If still no method found, fall back to original behavior
+    // If addTo* not found, fall back to regular method search (set*, create*, etc.)
     if ($func_name === null) {
       [$func_name, $parent] = $this->getValidFunctionName("set", $child_tag, $child);
     }
-
+    
     $parent->$func_name($child);
+  }
+
+  /**
+   * Cache-aware method_exists check
+   * 
+   * @param string|object $class Class name or object
+   * @param string $method Method name
+   * @return bool
+   */
+  private function cachedMethodExists($class, $method) {
+    $class_name = is_object($class) ? get_class($class) : $class;
+    $cache_key = $class_name . '::' . $method;
+    if (!isset($this->method_exists_cache[$cache_key])) {
+      $this->method_exists_cache[$cache_key] = method_exists($class, $method);
+    }
+    return $this->method_exists_cache[$cache_key];
   }
 
   /**
@@ -629,12 +673,22 @@ class ErnParserController {
    * @return string Tag name without namespace prefix
    */
   private function stripNamespacePrefix(string $tag): string {
+    // Check cache first
+    if (isset($this->namespace_cache[$tag])) {
+      return $this->namespace_cache[$tag];
+    }
+    
     // Remove common namespace prefixes (ern:, ernm:, etc.)
     // Pattern: any word characters followed by colon at the start
     if (preg_match('/^[a-zA-Z0-9_]+:(.+)$/', $tag, $matches)) {
-      return $matches[1];
+      $normalized = $matches[1];
+    } else {
+      $normalized = $tag;
     }
-    return $tag;
+    
+    // Cache the result
+    $this->namespace_cache[$tag] = $normalized;
+    return $normalized;
   }
 
   /**
@@ -699,6 +753,12 @@ class ErnParserController {
    * @return type
    */
   private function listPossibleFunctionNames($prefix, $tag) {
+    // Check cache first
+    $cache_key = $prefix . '::' . $tag;
+    if (isset($this->function_names_cache[$cache_key])) {
+      return $this->function_names_cache[$cache_key];
+    }
+    
     // It's possible this script added a ##\d+ information at the end of
     // the tag to avoid key duplicate. Remove it here.
     if (strpos($tag, "##") !== false) {
@@ -723,15 +783,14 @@ class ErnParserController {
 
         break;
       case "set":
-        // order is important
+        // order is important - try set* first for single values, addTo* for lists
+        $func_names[] = $prefix . $tag;
+        $func_names[] = $prefix . $tag . "s";
+        $func_names[] = $prefix . $tag . "List";
         $func_names[] = "addTo" . $tag;
         $func_names[] = "addTo" . $tag . "List";
         $func_names[] = "create" . $tag;
         $func_names[] = "create" . $tag . "List";
-        $func_names[] = $prefix . $tag;
-        $func_names[] = $prefix . $tag;
-        $func_names[] = $prefix . $tag . "s";
-        $func_names[] = $prefix . $tag . "List";
 
         // Hack for release deals. DDEX 4.1.1 is not consistent. It has a DealList
         // and ReleaseDeals in it. This parser would expect a ReleaseDealList instead
@@ -745,6 +804,8 @@ class ErnParserController {
         throw new \Exception("Prefix must be get or set");
     }
 
+    // Cache before returning
+    $this->function_names_cache[$cache_key] = $func_names;
     return $func_names;
   }
 
@@ -793,8 +854,10 @@ class ErnParserController {
       $value = $this->lastElement[2] . $value;
     }
     $value_clean = trim($value);
-    $pile_tags = array_column($this->pile, 'tag');
-    $this->log($value_clean . ": " . implode("->", $pile_tags));
+    if ($this->display_log) {
+      $pile_tags = array_column($this->pile, 'tag');
+      $this->log($value_clean . ": " . implode("->", $pile_tags));
+    }
     [$func_name, $elem] = $this->getValidFunctionName("set", $tag, $elem);
 
     // It's possible we're trying to set a text but it's expecting an
@@ -854,7 +917,7 @@ class ErnParserController {
       
       $function_used = false;
       foreach ($func_names as $func_name) {
-        if (!method_exists($elem, $func_name)) {
+        if (!$this->cachedMethodExists($elem, $func_name)) {
           continue;
         }
         $function_used = true;
@@ -871,20 +934,6 @@ class ErnParserController {
     throw new Exception("No functions found for this tag: $tag. Path is " . implode(",", $pile_tags) . $fileInfo);
   }
 
-  private function expectedParamIsArray($class, $func_name) {
-    $method = new ReflectionMethod($class, $func_name);
-
-    if (count($method->getParameters()) != 1) {
-      throw new Exception("This reflection method only supports 1 parameter");
-    }
-
-    /* @var $param ReflectionParameter */
-    $param = $method->getParameters()[0];
-    $type = $param->getType();
-
-    $is_array = $param->isArray();
-    return $is_array;
-  }
 
   /**
    * From the doc of a class and function (guessed from $tag), return the type
@@ -895,6 +944,13 @@ class ErnParserController {
    * @return string
    */
   private function getTypeOfElementFromDoc($class, $tag) {
+    // Check cache first
+    $class_name = is_object($class) ? get_class($class) : $class;
+    $cache_key = $class_name . '::' . $tag;
+    if (isset($this->type_cache[$cache_key])) {
+      return $this->type_cache[$cache_key];
+    }
+    
     // First, try to find the method on the provided parent class
     // This is important for maintaining context when the parent might not be at the end of the pile
     $func_names = $this->listPossibleFunctionNames("get", $tag);
@@ -903,7 +959,7 @@ class ErnParserController {
     
     // Check the provided parent class first
     foreach ($func_names as $func_name) {
-      if (method_exists($class, $func_name)) {
+      if ($this->cachedMethodExists($class, $func_name)) {
         $found_class = $class;
         $function_name = $func_name;
         break;
@@ -915,15 +971,27 @@ class ErnParserController {
       [$function_name, $found_class] = $this->getValidFunctionName("get", $tag);
     }
 
-    $rc = new ReflectionMethod($found_class, $function_name);
+    // Cache ReflectionMethod instance
+    $reflection_key = (is_object($found_class) ? get_class($found_class) : $found_class) . '::' . $function_name;
+    if (!isset($this->reflection_cache[$reflection_key])) {
+      $this->reflection_cache[$reflection_key] = new ReflectionMethod($found_class, $function_name);
+    }
+    $rc = $this->reflection_cache[$reflection_key];
+    
     $doc = $rc->getDocComment();
-    preg_match("/@return (\S+).*/", $doc, $matches);
+    // Match @return type, handling both single types and array types (with [])
+    preg_match("/@return\s+([^\s\[\]]+)(\[\])?/", $doc, $matches);
     if (count($matches) > 1) {
-      $type = str_replace("[]", "", $matches[1]);
+      $type = $matches[1]; // Get the base type without []
+      // Ensure we remove any [] that might have been captured separately
+      $type = preg_replace("/\[\]/", "", $type);
+      $type = trim($type);
     } else {
       $type = "\\DedexBundle\\Entity\\Ern{$this->version}\\{$tag}Type";
     }
 
+    // Cache the result
+    $this->type_cache[$cache_key] = $type;
     return $type;
   }
 
@@ -957,12 +1025,11 @@ class ErnParserController {
     }
 
     $type = $matches[1];
+    // Remove [] from array types (e.g., "PartyIdType[]" -> "PartyIdType")
+    $type = preg_replace("/\[\]/", "", $type);
+    $type = trim($type);
     $this->log("create type $type");
     if ($type == "\DateTime") {
-      // Check if the parameter is required (not nullable, no default value)
-      $param = $rc->getParameters()[0];
-      $is_required = !$param->allowsNull() && !$param->isDefaultValueAvailable();
-      
       // Remove milliseconds if any
       $value_default = $value_default ?? '0000-00-00T00:00:00';
       $value = preg_replace("/\.\d+\+/", "+", $value_default);
@@ -990,13 +1057,9 @@ class ErnParserController {
         try {
           $new_elem = new DateTime($value_default);
         } catch (\Exception $e) {
-          // If required, throw error; otherwise return default
-          if ($is_required) {
-            $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
-            throw new Exception("Failed to parse required DateTime value: '$value_default' for method $class::$function" . $fileInfo);
-          }
-          // Return a default DateTime for optional fields
-          $new_elem = new DateTime('1970-01-01T00:00:00');
+          // Always throw - let the type system handle required vs optional
+          $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
+          throw new Exception("Failed to parse DateTime value: '$value_default' for method $class::$function" . $fileInfo);
         }
       }
     } elseif ($type == "\DateInterval") {
@@ -1250,6 +1313,13 @@ class ErnParserController {
    * @return Ddex The main entity modelling the full DDex file
    */
   public function parse(string $file_path) {
+    // Clear all caches at start of each parse
+    $this->method_exists_cache = [];
+    $this->reflection_cache = [];
+    $this->namespace_cache = [];
+    $this->type_cache = [];
+    $this->function_names_cache = [];
+    
     $this->file_path = $file_path;
 
     if (!file_exists($file_path)) {
