@@ -863,6 +863,11 @@ class ErnParserController {
     // It's possible we're trying to set a text but it's expecting an
     // object (where text should be placed in value).
     $value_inst = $this->instanciateTypeFromDoc($elem, $func_name, $value_clean);
+    
+    // If parsing returned null (empty/invalid value), skip setting the value
+    if ($value_inst === null) {
+      return;
+    }
 
     $this->lastElement = [$elem, $tag, $value];
 
@@ -1030,8 +1035,12 @@ class ErnParserController {
     $type = trim($type);
     $this->log("create type $type");
     if ($type == "\DateTime") {
+      // Empty values are valid (dates can be optional) - return null to skip setting
+      if (empty($value_default) || trim($value_default) === '') {
+        return null;
+      }
+      
       // Remove milliseconds if any
-      $value_default = $value_default ?? '0000-00-00T00:00:00';
       $value = preg_replace("/\.\d+\+/", "+", $value_default);
       
       // Handle UTC timezone indicator (Z) - convert to +00:00 format
@@ -1039,25 +1048,16 @@ class ErnParserController {
         $value = substr($value, 0, -1) . '+00:00';
       }
       
-      // Support both ATOM or regular datetime format
+      // Try format-based parsing first (fastest for known formats)
       $format = (mb_strlen($value) > mb_strlen('0000-00-00T00:00:00')) ? "Y-m-d\TH:i:sP" : "Y-m-d\TH:i:s";
       $new_elem = DateTime::createFromFormat($format, $value);
       
-      // If createFromFormat fails, try alternative formats
+      // If format parsing fails, use DateTime constructor as fallback (handles many ISO 8601 variants efficiently)
       if ($new_elem === false) {
-        // Try ISO 8601 format with timezone
-        $new_elem = DateTime::createFromFormat(DateTime::ATOM, $value_default);
-      }
-      if ($new_elem === false) {
-        // Try ISO 8601 format without timezone
-        $new_elem = DateTime::createFromFormat("Y-m-d\TH:i:s", $value);
-      }
-      if ($new_elem === false) {
-        // Last resort: try standard DateTime constructor
         try {
           $new_elem = new DateTime($value_default);
         } catch (\Exception $e) {
-          // Always throw - let the type system handle required vs optional
+          // DateTime constructor failed - value is likely invalid (but not empty, so throw)
           $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
           throw new Exception("Failed to parse DateTime value: '$value_default' for method $class::$function" . $fileInfo);
         }
