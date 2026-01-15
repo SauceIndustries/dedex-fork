@@ -832,6 +832,32 @@ class ErnParserController {
       return;
     }
 
+    // Special handling for complex types with simpleContent (like ReleaseResourceReferenceType)
+    // These types have a value() method to set the text content directly on the object
+    // We should set the value on the current element, not create a new object
+    if (!$this->set_to_parent && count($this->pile) > 0) {
+      $current_element = $this->getLastPileElement();
+      if ($current_element !== null && is_object($current_element) && method_exists($current_element, 'value')) {
+        // If the previous element was the same, concatenate value
+        // xml_parser is known to split values when encountering multibyte chars
+        $current_tag = $this->getLastPileTag();
+        if (!empty($this->lastElement) && $this->lastElement[0] === $current_element && $this->lastElement[1] === $current_tag) {
+          $value = $this->lastElement[2] . $value;
+        }
+        $value_clean = trim($value);
+        if ($value_clean !== "") {
+          if ($this->display_log) {
+            $pile_tags = array_column($this->pile, 'tag');
+            $this->log($value_clean . ": " . implode("->", $pile_tags) . " (setting value on current element)");
+          }
+          // Set the value directly on the current element using value() method
+          $current_element->value($value_clean);
+          $this->lastElement = [$current_element, $current_tag, $value];
+        }
+        return; // Don't process further - value is set on current element
+      }
+    }
+
     // Use last element in pile
     $pile_count = count($this->pile);
 
