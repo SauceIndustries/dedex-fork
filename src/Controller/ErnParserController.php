@@ -850,8 +850,35 @@ class ErnParserController {
             $pile_tags = array_column($this->pile, 'tag');
             $this->log($value_clean . ": " . implode("->", $pile_tags) . " (setting value on current element)");
           }
-          // Set the value directly on the current element using value() method
-          $current_element->value($value_clean);
+          // Centralized date formatting: format date strings before setting value
+          // This ensures all date types get consistent formatting regardless of ERN version
+          $value_clean = $this->formatDateValueForObject($current_element, $value_clean);
+          
+          // For DateTime-based types, use reflection to set formatted string directly
+          // This avoids needing entity class modifications
+          $class_name = get_class($current_element);
+          if (is_subclass_of($class_name, EventDateTimeType::class) ||
+              $this->isEventDateTimeWithoutFlagsType($class_name) ||
+              $class_name === 'DedexBundle\\Entity\\DdexC\\EventDateType') {
+            // Parse the string to DateTime, then set formatted string via reflection
+            try {
+              $dt = $this->parseDateString($value_clean);
+              if ($dt !== null) {
+                $dt->setTimezone(new \DateTimeZone('UTC'));
+                $isDateTimeType = is_subclass_of($class_name, EventDateTimeType::class) ||
+                                  $this->isEventDateTimeWithoutFlagsType($class_name);
+                $this->setFormattedDateValue($current_element, $dt, $isDateTimeType);
+                // Also call value() to maintain compatibility (stores DateTime internally)
+                $current_element->value($dt);
+              }
+            } catch (\Exception $e) {
+              // Fallback to direct value() call if parsing fails
+              $current_element->value($value_clean);
+            }
+          } else {
+            // For string-based types, just set the value directly
+            $current_element->value($value_clean);
+          }
           $this->lastElement = [$current_element, $current_tag, $value];
         }
         return; // Don't process further - value is set on current element
@@ -1061,33 +1088,14 @@ class ErnParserController {
     $type = trim($type);
     $this->log("create type $type");
     if ($type == "\DateTime") {
-      // Empty values are valid (dates can be optional) - return null to skip setting
-      if (empty($value_default) || trim($value_default) === '') {
+      // Use unified date parsing function
+      $new_elem = $this->parseDateString($value_default);
+      // If parsing returned null (empty/invalid value), skip setting the value
+      if ($new_elem === null) {
         return null;
       }
-      
-      // Remove milliseconds if any
-      $value = preg_replace("/\.\d+\+/", "+", $value_default);
-      
-      // Handle UTC timezone indicator (Z) - convert to +00:00 format
-      if (substr($value, -1) === 'Z') {
-        $value = substr($value, 0, -1) . '+00:00';
-      }
-      
-      // Try format-based parsing first (fastest for known formats)
-      $format = (mb_strlen($value) > mb_strlen('0000-00-00T00:00:00')) ? "Y-m-d\TH:i:sP" : "Y-m-d\TH:i:s";
-      $new_elem = DateTime::createFromFormat($format, $value);
-      
-      // If format parsing fails, use DateTime constructor as fallback (handles many ISO 8601 variants efficiently)
-      if ($new_elem === false) {
-        try {
-          $new_elem = new DateTime($value_default);
-        } catch (\Exception $e) {
-          // DateTime constructor failed - value is likely invalid (but not empty, so throw)
-          $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
-          throw new Exception("Failed to parse DateTime value: '$value_default' for method $class::$function" . $fileInfo);
-        }
-      }
+      // DO NOT convert to UTC - preserve original timezone for DateTime objects
+      // The tests expect the time as it appears in the XML, not converted to UTC
     } elseif ($type == "\DateInterval") {
         // Check for ISO8601:2004 format
         preg_match('/^P(?:(\d+D))?(T(?:(\d+H))?(?:(\d+M))?(?:(\d+(?:\.\d+)?S))?)?$/i', $value_default, $matches);
@@ -1104,11 +1112,63 @@ class ErnParserController {
             }
         }
     } elseif (is_subclass_of($type, EventDateTimeType::class)) {
-        $new_elem = new $type(new DateTime($value_default));
+        // EventDateTimeType expects a DateTime object
+        // Parse the date string and create DateTime, then convert to UTC for consistent formatting
+        $dt = $this->parseDateString($value_default);
+        if ($dt === null) {
+          return null;
+        }
+        // Convert to UTC for consistent formatting
+        $dt->setTimezone(new \DateTimeZone('UTC'));
+        $new_elem = new $type($dt);
+        // Use reflection to set formatted string in __value (avoids entity class modifications)
+        $this->setFormattedDateValue($new_elem, $dt, true); // true = date-time format
+    } elseif ($this->isEventDateTimeWithoutFlagsType($type)) {
+        // EventDateTimeWithoutFlagsType (used in ERN 4.3) expects a DateTime object
+        // Parse the date string and create DateTime, then convert to UTC for consistent formatting
+        $dt = $this->parseDateString($value_default);
+        if ($dt === null) {
+          return null;
+        }
+        // Convert to UTC for consistent formatting
+        $dt->setTimezone(new \DateTimeZone('UTC'));
+        $new_elem = new $type($dt);
+        // Use reflection to set formatted string in __value (avoids entity class modifications)
+        $this->setFormattedDateValue($new_elem, $dt, true); // true = date-time format
     } elseif ($type === '\\' . Ern341EventDateType::class) {
-        $new_elem = new $type(new DateTime($value_default));
+        // DdexC\EventDateType (ERN 341) expects a DateTime object
+        $dt = $this->parseDateString($value_default);
+        if ($dt === null) {
+          return null;
+        }
+        // Convert to UTC for consistent formatting
+        $dt->setTimezone(new \DateTimeZone('UTC'));
+        $new_elem = new $type($dt);
+        // Use reflection to set formatted string in __value (avoids entity class modifications)
+        $this->setFormattedDateValue($new_elem, $dt, false); // false = date-only format
     } elseif (is_subclass_of($type, EventDateType::class)) {
-        $new_elem = new $type($value_default);
+        // Check if this is DdexC\EventDateType (expects DateTime)
+        if ($type === 'DedexBundle\\Entity\\DdexC\\EventDateType') {
+          // DdexC\EventDateType expects DateTime
+          $dt = $this->parseDateString($value_default);
+          if ($dt === null) {
+            return null;
+          }
+          // Convert to UTC for consistent formatting
+          $dt->setTimezone(new \DateTimeZone('UTC'));
+          $new_elem = new $type($dt);
+          // Use reflection to set formatted string in __value (avoids entity class modifications)
+          $this->setFormattedDateValue($new_elem, $dt, false); // false = date-only format
+        } else {
+          // For all other EventDateType classes, they expect strings
+          // EventDateType should remain date-only (YYYY-MM-DD) - don't add time component
+          // Only normalize timezone if present (Z -> +00:00)
+          $formatted = $value_default;
+          if (substr($formatted, -1) === 'Z') {
+            $formatted = substr($formatted, 0, -1) . '+00:00';
+          }
+          $new_elem = new $type($formatted);
+        }
     } else {
       try {
         $new_elem = new $type($value_default);
@@ -1119,6 +1179,217 @@ class ErnParserController {
       }
     }
     return $new_elem;
+  }
+
+  /**
+   * Centralized date formatting: formats date values based on the object type.
+   * This ensures consistent date formatting across all ERN versions without
+   * requiring modifications to each entity class.
+   * 
+   * IMPORTANT: 
+   * - EventDateType (start_date/end_date) should remain date-only (YYYY-MM-DD)
+   * - EventDateTimeType (start_time/end_time) should be date-time with timezone (YYYY-MM-DDThh:mm:ss+00:00)
+   * 
+   * @param object $obj The object receiving the date value
+   * @param string $value Date string from XML
+   * @return string Formatted date string
+   */
+  private function formatDateValueForObject($obj, string $value): string {
+    $class_name = get_class($obj);
+    
+    // EventDateTimeType and EventDateTimeWithoutFlagsType: format as date-time with timezone
+    if (is_subclass_of($class_name, EventDateTimeType::class) ||
+        $this->isEventDateTimeWithoutFlagsType($class_name)) {
+      // Format the date string to include time and timezone
+      return $this->formatDateStringForEventDateType($value);
+    }
+    
+    // EventDateType: keep as date-only (don't add time component)
+    // The value should remain in YYYY-MM-DD format as per XSD specification
+    if (is_subclass_of($class_name, EventDateType::class)) {
+      // Only normalize timezone if present (Z -> +00:00), but don't add time
+      if (substr($value, -1) === 'Z') {
+        return substr($value, 0, -1) . '+00:00';
+      }
+      // Return as-is for date-only format
+      return $value;
+    }
+    
+    // Not a date type, return as-is
+    return $value;
+  }
+
+  /**
+   * Check if a class is EventDateTimeWithoutFlagsType (used in ERN 4.3)
+   * 
+   * @param string $class_name
+   * @return bool
+   */
+  private function isEventDateTimeWithoutFlagsType(string $class_name): bool {
+    // Check for EventDateTimeWithoutFlagsType in various ERN versions
+    return strpos($class_name, 'EventDateTimeWithoutFlagsType') !== false;
+  }
+
+  /**
+   * Use reflection to set formatted date string in __value property.
+   * This allows us to avoid modifying entity classes - all formatting is done in the parser.
+   * 
+   * @param object $obj The entity object (EventDateType, EventDateTimeType, etc.)
+   * @param \DateTime $dt The DateTime object to format
+   * @param bool $isDateTimeType If true, format as date-time (Y-m-d\TH:i:s+00:00), if false format as date-only (Y-m-d)
+   */
+  private function setFormattedDateValue($obj, \DateTime $dt, bool $isDateTimeType): void {
+    try {
+      $reflection = new \ReflectionClass($obj);
+      $property = $reflection->getProperty('__value');
+      $property->setAccessible(true);
+      
+      // Format based on type
+      if ($isDateTimeType) {
+        // EventDateTimeType: format as date-time with timezone
+        $formatted = $dt->format('Y-m-d\TH:i:s') . '+00:00';
+      } else {
+        // EventDateType: format as date-only
+        $formatted = $dt->format('Y-m-d');
+      }
+      
+      $property->setValue($obj, $formatted);
+    } catch (\ReflectionException $e) {
+      // If reflection fails, log but don't break parsing
+      $this->log("Warning: Could not set formatted date value via reflection: " . $e->getMessage());
+    }
+  }
+
+  /**
+   * Format a date string for EventDateType (string-based).
+   * Ensures date-only formats get time component and all dates have timezone.
+   * 
+   * @param string $value Date string from XML
+   * @return string Formatted date string (Y-m-d\TH:i:s+00:00 format)
+   */
+  private function formatDateStringForEventDateType(string $value): string {
+    $value = trim($value);
+    if (empty($value)) {
+      return $value;
+    }
+    
+    // Remove milliseconds if any
+    $value = preg_replace("/\.\d+\+/", "+", $value);
+    $value = preg_replace("/\.\d+Z/", "Z", $value);
+    
+    // Date-only format: add time and timezone
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+      return $value . 'T00:00:00+00:00';
+    }
+    
+    // Date-time without timezone: add UTC timezone
+    if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/', $value)) {
+      return $value . '+00:00';
+    }
+    
+    // Date-time with Z: convert to +00:00
+    if (substr($value, -1) === 'Z') {
+      return substr($value, 0, -1) . '+00:00';
+    }
+    
+    // Already has timezone: return as-is (should already be in correct format)
+    return $value;
+  }
+
+  /**
+   * Parse a date string into a DateTime object.
+   * If time is missing, defaults to 00:00:00 UTC.
+   * Preserves original timezone if present, otherwise defaults to UTC.
+   * 
+   * @param string $value Date string (can be date-only or date-time)
+   * @return DateTime|null Returns DateTime object or null if value is empty
+   * @throws Exception If date cannot be parsed
+   */
+  private function parseDateString(string $value): ?DateTime {
+    $original_value = $value;
+    $value = trim($value);
+    
+    // Empty values return null
+    if (empty($value)) {
+      return null;
+    }
+    
+    $is_date_only = false;
+    $has_timezone = false;
+    $timezone = null;
+    
+    // Remove milliseconds if any (e.g., "2024-01-15T10:30:00.123+00:00" -> "2024-01-15T10:30:00+00:00")
+    $value = preg_replace("/\.\d+\+/", "+", $value);
+    $value = preg_replace("/\.\d+Z/", "Z", $value);
+    
+    // Check if this is a date-only format (YYYY-MM-DD) without time
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+      // Date-only format: default to 00:00:00 UTC
+      $value .= 'T00:00:00+00:00';
+      $is_date_only = true;
+      $timezone = new \DateTimeZone('UTC');
+      $this->log("Date-only format detected, defaulting to 00:00:00 UTC: " . $value);
+    }
+    // Check if this is a date with time but no timezone (YYYY-MM-DDTHH:MM:SS)
+    elseif (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/', $value)) {
+      // Date-time without timezone: default to UTC
+      $value .= '+00:00';
+      $timezone = new \DateTimeZone('UTC');
+      $this->log("Date-time without timezone detected, defaulting to UTC: " . $value);
+    }
+    // Check if this is a date with time and milliseconds but no timezone (YYYY-MM-DDTHH:MM:SS.mmm)
+    elseif (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+$/', $value)) {
+      // Date-time with milliseconds but no timezone: default to UTC
+      $value .= '+00:00';
+      $timezone = new \DateTimeZone('UTC');
+      $this->log("Date-time with milliseconds but no timezone detected, defaulting to UTC: " . $value);
+    }
+    // Handle UTC timezone indicator (Z) - convert to +00:00 for consistent formatting
+    elseif (substr($value, -1) === 'Z') {
+      $has_timezone = true;
+      // Convert Z to +00:00 for consistent formatting
+      $value = substr($value, 0, -1) . '+00:00';
+    }
+    // Check if it has a timezone offset (e.g., +04:00, -05:00)
+    elseif (preg_match('/[+-]\d{2}:\d{2}$/', $value)) {
+      $has_timezone = true;
+      // Extract timezone from the value
+      if (preg_match('/([+-]\d{2}):(\d{2})$/', $value, $tz_matches)) {
+        $tz_offset = $tz_matches[1] . $tz_matches[2]; // e.g., "+0400"
+        try {
+          $timezone = timezone_open(sprintf('Etc/GMT%s', str_replace(['+', '-'], ['-', '+'], $tz_offset)));
+        } catch (\Exception $e) {
+          // Fallback to UTC if timezone parsing fails
+          $timezone = new \DateTimeZone('UTC');
+        }
+      }
+    }
+    
+    // Use DateTime constructor which handles timezones correctly
+    // It will preserve the original timezone if present, or use the default timezone
+    try {
+      // Create DateTime - it will parse the timezone from the string if present
+      $new_elem = new DateTime($value);
+      
+      // If this was originally a date-only format, ensure time is 00:00:00
+      if ($is_date_only) {
+        $new_elem->setTime(0, 0, 0);
+        // For date-only, explicitly set to UTC
+        $new_elem->setTimezone(new \DateTimeZone('UTC'));
+      } elseif (!$has_timezone && $timezone !== null) {
+        // If we added a timezone (date-time without timezone), set it
+        $new_elem->setTimezone($timezone);
+      }
+      // DO NOT convert to UTC here - preserve original timezone
+      // DateTime objects (like message_date) should keep their original timezone
+      // EventDateType/EventDateTimeType will convert to UTC when needed
+      
+      return $new_elem;
+    } catch (\Exception $e) {
+      // DateTime constructor failed - value is likely invalid
+      $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
+      throw new Exception("Failed to parse date value: '{$original_value}'" . $fileInfo, 0, $e);
+    }
   }
 
   protected function intervalFromIso86012004String(string $value): DateInterval
