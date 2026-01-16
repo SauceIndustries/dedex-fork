@@ -615,16 +615,101 @@ class ErnParserController {
     $child_tag = $last_entry['tag'];
     $child = $last_entry['element'];
 
-    // When attaching objects, try addTo* methods first (for list elements)
-    // This matches the old behavior and avoids incorrect set* method usage
     $pile_count = count($this->pile);
-    $start_index = $pile_count - 2; // Parent is second-to-last
+    $immediate_parent_index = $pile_count - 2; // Parent is second-to-last
+    $immediate_parent = isset($this->pile[$immediate_parent_index]) && isset($this->pile[$immediate_parent_index]['element']) 
+      ? $this->pile[$immediate_parent_index]['element'] 
+      : null;
     
     $func_name = null;
     $parent = null;
     
-    // First, try addTo* methods (for list elements) by searching backwards through pile
-    $add_to_names = ["addTo" . $child_tag, "addTo" . $child_tag . "List"];
+    // Priority 1: Check immediate parent first
+    // This ensures properties attach to their immediate parent rather than an ancestor
+    // (e.g., ReleaseResourceReference on ResourceGroupContentItem, not on Release)
+    if ($immediate_parent !== null && is_object($immediate_parent)) {
+      // First, try addTo* methods (for list properties)
+      $add_to_methods = ["addTo" . $child_tag, "addTo" . $child_tag . "List"];
+      foreach ($add_to_methods as $add_to_method) {
+        if ($this->cachedMethodExists($immediate_parent, $add_to_method)) {
+          $immediate_parent->$add_to_method($child);
+          return;
+        }
+      }
+      
+      // Then, try set* methods, but only if they don't expect an array (single-value properties)
+      // Check exact match first, then plural, then List (List methods are more likely to expect arrays)
+      $set_methods = ["set" . $child_tag, "set" . $child_tag . "s", "set" . $child_tag . "List"];
+      foreach ($set_methods as $set_method) {
+        if ($this->cachedMethodExists($immediate_parent, $set_method)) {
+          // Check if the set* method expects an array - if so, it's a list property and we should skip it
+          // (we already checked addTo* above, so if we get here and it expects array, something is wrong)
+          $reflection_key = get_class($immediate_parent) . '::' . $set_method;
+          if (!isset($this->reflection_cache[$reflection_key])) {
+            try {
+              $this->reflection_cache[$reflection_key] = new ReflectionMethod($immediate_parent, $set_method);
+            } catch (\ReflectionException $e) {
+              // If reflection fails, skip this method
+              continue;
+            }
+          }
+          $rm = $this->reflection_cache[$reflection_key];
+          $params = $rm->getParameters();
+          if (count($params) > 0) {
+            $param = $params[0];
+            $type = $param->getType();
+            // If the parameter type is "array", this is a list property - skip it
+            // (we should have found addTo* method above)
+            if ($type !== null) {
+              // For PHP 7.2+, getType() returns ReflectionNamedType or ReflectionUnionType
+              // For PHP 8.0+, we need to check if it's a named type
+              // Handle both ReflectionNamedType and ReflectionUnionType
+              $type_name = null;
+              if (is_string($type)) {
+                // PHP 7.0-7.3: getType() can return a string
+                $type_name = $type;
+              } elseif (method_exists($type, 'getName')) {
+                // PHP 7.4+: ReflectionNamedType
+                $type_name = $type->getName();
+              } elseif (method_exists($type, '__toString')) {
+                // Fallback: try to convert to string
+                $type_name = (string)$type;
+              }
+              // Check if it's an array type (could be "array" or a union type containing array)
+              if ($type_name === 'array') {
+                continue; // Skip this set* method, it's for lists
+              }
+              // For PHP 8.0+ union types, check if array is one of the types
+              if (method_exists($type, 'getTypes')) {
+                $union_types = $type->getTypes();
+                foreach ($union_types as $union_type) {
+                  $union_type_name = null;
+                  if (is_string($union_type)) {
+                    $union_type_name = $union_type;
+                  } elseif (method_exists($union_type, 'getName')) {
+                    $union_type_name = $union_type->getName();
+                  }
+                    if ($union_type_name === 'array') {
+                      continue 2; // Skip this set* method, it's for lists
+                    }
+                }
+              }
+            }
+          }
+          // This set* method doesn't expect an array, so it's a single-value property - use it
+          $immediate_parent->$set_method($child);
+          return;
+        }
+      }
+    }
+    
+    // Priority 3: Search backwards (only if immediate parent has no matching method)
+    // This handles cases where the immediate parent might not have the method
+    // (e.g., TechnicalDetails should be on SoundRecording, not ResourceList)
+    $start_index = $immediate_parent_index - 1; // Start from element before immediate parent
+    
+    // First, try addTo* methods when searching backwards (for list properties)
+    $add_to_methods = ["addTo" . $child_tag, "addTo" . $child_tag . "List"];
     for ($i = $start_index; $i >= 0; $i--) {
       if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
         continue;
@@ -633,16 +718,91 @@ class ErnParserController {
       if (!is_object($elem)) {
         continue;
       }
-      foreach ($add_to_names as $add_to_name) {
-        if ($this->cachedMethodExists($elem, $add_to_name)) {
-          $func_name = $add_to_name;
+      foreach ($add_to_methods as $add_to_method) {
+        if ($this->cachedMethodExists($elem, $add_to_method)) {
+          $func_name = $add_to_method;
           $parent = $elem;
           break 2;
         }
       }
     }
     
-    // If addTo* not found, fall back to regular method search (set*, create*, etc.)
+    // If addTo* not found, try set* methods when searching backwards (for single-value properties)
+    // But only if they don't expect an array
+    if ($func_name === null) {
+      $set_methods = ["set" . $child_tag, "set" . $child_tag . "s", "set" . $child_tag . "List"];
+      for ($i = $start_index; $i >= 0; $i--) {
+        if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
+          continue;
+        }
+        $elem = $this->pile[$i]['element'];
+        if (!is_object($elem)) {
+          continue;
+        }
+        foreach ($set_methods as $set_method) {
+          if ($this->cachedMethodExists($elem, $set_method)) {
+            // Check if the set* method expects an array - if so, skip it (it's a list property)
+            $reflection_key = get_class($elem) . '::' . $set_method;
+            if (!isset($this->reflection_cache[$reflection_key])) {
+              try {
+                $this->reflection_cache[$reflection_key] = new ReflectionMethod($elem, $set_method);
+              } catch (\ReflectionException $e) {
+                // If reflection fails, skip this method
+                continue;
+              }
+            }
+            $rm = $this->reflection_cache[$reflection_key];
+            $params = $rm->getParameters();
+            if (count($params) > 0) {
+              $param = $params[0];
+              $type = $param->getType();
+              // If the parameter type is "array", this is a list property - skip it
+              if ($type !== null) {
+                // For PHP 7.2+, getType() returns ReflectionNamedType or ReflectionUnionType
+                // For PHP 8.0+, we need to check if it's a named type
+                // Handle both ReflectionNamedType and ReflectionUnionType
+                $type_name = null;
+                if (is_string($type)) {
+                  // PHP 7.0-7.3: getType() can return a string
+                  $type_name = $type;
+                } elseif (method_exists($type, 'getName')) {
+                  // PHP 7.4+: ReflectionNamedType
+                  $type_name = $type->getName();
+                } elseif (method_exists($type, '__toString')) {
+                  // Fallback: try to convert to string
+                  $type_name = (string)$type;
+                }
+                // Check if it's an array type (could be "array" or a union type containing array)
+                if ($type_name === 'array') {
+                  continue; // Skip this set* method, it's for lists
+                }
+                // For PHP 8.0+ union types, check if array is one of the types
+                if (method_exists($type, 'getTypes')) {
+                  $union_types = $type->getTypes();
+                  foreach ($union_types as $union_type) {
+                    $union_type_name = null;
+                    if (is_string($union_type)) {
+                      $union_type_name = $union_type;
+                    } elseif (method_exists($union_type, 'getName')) {
+                      $union_type_name = $union_type->getName();
+                    }
+                    if ($union_type_name === 'array') {
+                      continue 2; // Skip this set* method, it's for lists
+                    }
+                  }
+                }
+              }
+            }
+            // This set* method doesn't expect an array, so it's a single-value property - use it
+            $func_name = $set_method;
+            $parent = $elem;
+            break 2;
+          }
+        }
+      }
+    }
+    
+    // If still not found, fall back to getValidFunctionName (for create* methods, etc.)
     if ($func_name === null) {
       [$func_name, $parent] = $this->getValidFunctionName("set", $child_tag, $child);
     }
