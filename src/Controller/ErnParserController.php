@@ -93,10 +93,11 @@ class ErnParserController {
   private $ern = null;
 
   /**
-   * key=tag_name and value=current element (object)
-   * @var type
+   * Stack of elements being parsed. Each entry is ['tag' => string, 'element' => object]
+   * Maintains insertion order for reliable LIFO operations
+   * @var array
    */
-  private $pile = array();
+  private $pile = [];
 
   /**
    * Contains a list of ids (spl_object_id) of objects that had a closed
@@ -105,6 +106,42 @@ class ErnParserController {
    * @var array
    */
   private $closed_objects = [];
+
+  /**
+   * The path of the file being parsed
+   * @var string
+   */
+  private $file_path = null;
+
+  /**
+   * Cache for method_exists results: [class::method => bool]
+   * @var array
+   */
+  private $method_exists_cache = [];
+
+  /**
+   * Cache for ReflectionMethod instances: [class::method => ReflectionMethod]
+   * @var array
+   */
+  private $reflection_cache = [];
+
+  /**
+   * Cache for normalized tag names: [original => normalized]
+   * @var array
+   */
+  private $namespace_cache = [];
+
+  /**
+   * Cache for type lookups: [class::tag => type]
+   * @var array
+   */
+  private $type_cache = [];
+
+  /**
+   * Cache for function name lists: [prefix::tag => [names]]
+   * @var array
+   */
+  private $function_names_cache = [];
 
   /**
    * If true, display logs (for debugging purpose mainly)
@@ -146,11 +183,21 @@ class ErnParserController {
   private $lastElement = [];
 
   /**
+   * Tracks when we're inside a list container that uses addTo* methods.
+   * Format: ['listTag' => 'InstantGratificationResourceList', 'parent' => $parentObject]
+   * @var array|null
+   */
+  private $current_list_context = null;
+
+  /**
    * Log something (will echo if display_log is true)
    * @param type $message
    */
   private function log($message) {
     if ($this->display_log) {
+      // Use error_log so it goes to PHP error log (works in both CLI and web contexts)
+      error_log($message);
+      // Also echo for CLI compatibility
       echo $message . "\n";
     }
   }
@@ -239,26 +286,30 @@ class ErnParserController {
    * Function called when the parser encounters a tag opening
    *
    * @param type $parser
-   * @param string $name The name of the tag
+   * @param string $name The name of the tag (may contain namespace prefix)
    * @param array $attrs The attributes of the tag
    */
   private function callbackStartElement($parser, string $name, array $attrs) {
+    // Check ignore list first (contains attribute names like "xmlns:ern" that should not be normalized)
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
       return;
     }
 
+    // Strip namespace prefix from tag name (e.g., "ern:NewReleaseMessage" -> "NewReleaseMessage")
+    // This normalizes all tag names consistently, not just root elements
+    $name = $this->stripNamespacePrefix($name);
+
     // Create element here. But to know its type, call its parent getter if any.
     // There is only one case when there is no parent: NewReleaseMessage or PurgeReleaseMessage.
-    if ($name === "ern:NewReleaseMessage" || $name === "ernm:NewReleaseMessage") {
-      $name = "NewReleaseMessage";
-      $class_name = "DedexBundle\\Entity\\Ern{$this->version}\\$name";
-      $this->ern = new $class_name();
-    } else if ($name === "ern:PurgeReleaseMessage" || $name === "ernm:PurgeReleaseMessage") {
-      $name = "PurgeReleaseMessage";
+    if ($name === "NewReleaseMessage" || $name === "PurgeReleaseMessage") {
       $class_name = "DedexBundle\\Entity\\Ern{$this->version}\\$name";
       $this->ern = new $class_name();
     } else {
-      $parent = end($this->pile);
+      $parent = $this->getLastPileElement();
+      if ($parent === null) {
+        // This shouldn't happen, but handle gracefully
+        throw new Exception("No parent element found in pile for tag: $name");
+      }
       $parent_class = get_class($parent);
 
       // Special handling for incorrectly nested <Extent> elements inside ExtentType
@@ -273,9 +324,77 @@ class ErnParserController {
         return; // Don't create a new object, we'll handle this specially
       }
 
-      $class_name = $this->getTypeOfElementFromDoc($parent_class, $name);
+      // If we're inside a list context, handle child elements specially
+      if ($this->current_list_context !== null) {
+        // This is a child element of a list (like DealResourceReference inside InstantGratificationResourceList)
+        // Don't create an object or set set_to_parent - the value will be handled directly
+        // in setCurrentElement using the list context's addTo* method
+        return; // Don't create an object, we'll handle the value in setCurrentElement
+      }
+
+      // Try to find the correct parent class by searching backwards through the pile
+      // This handles cases where the immediate parent might not have the method
+      // (e.g., TechnicalDetails should be on SoundRecording, not ResourceList)
+      $func_names = $this->listPossibleFunctionNames("get", $name);
+      $found_parent_class = $parent_class;
+      $found = false;
+      
+      // Check if the immediate parent has the method
+      foreach ($func_names as $func_name) {
+        if ($this->cachedMethodExists($parent_class, $func_name)) {
+          $found = true;
+          break;
+        }
+      }
+      
+      // If not found, search backwards through the pile
+      if (!$found && count($this->pile) > 1) {
+        for ($i = count($this->pile) - 2; $i >= 0; $i--) {
+          $candidate = $this->pile[$i]['element'];
+          $candidate_class = get_class($candidate);
+          foreach ($func_names as $func_name) {
+            if ($this->cachedMethodExists($candidate_class, $func_name)) {
+              $found_parent_class = $candidate_class;
+              $found = true;
+              break 2;
+            }
+          }
+        }
+      }
+
+      $class_name = $this->getTypeOfElementFromDoc($found_parent_class, $name);
 
       if (!class_exists($class_name)) {
+        // Check if this is a list container (array type) that uses addTo* methods
+        // This pattern is used in ERN 41, 43, and 411 for elements like InstantGratificationResourceList
+        // which are defined as array<string> with xml_list inline: false
+        // Other ERN versions (32, 371, 381, 382, 383) use class types (e.g. DealResourceReferenceListType)
+        // so class_exists() will return true for them and this code won't execute
+        $add_to_method = "addTo" . $name;
+        
+        // Use the found parent (which has the method) instead of the immediate parent
+        $found_parent = null;
+        if ($found_parent_class !== $parent_class) {
+          // Find the actual object with the found parent class
+          for ($i = count($this->pile) - 1; $i >= 0; $i--) {
+            if (get_class($this->pile[$i]['element']) === $found_parent_class) {
+              $found_parent = $this->pile[$i]['element'];
+              break;
+            }
+          }
+        }
+        $parent_to_check = $found_parent !== null ? $found_parent : $parent;
+        
+        if ($this->cachedMethodExists($parent_to_check, $add_to_method)) {
+          // This is a list container, set up the context
+          $this->current_list_context = [
+            'listTag' => $name,
+            'parent' => $parent_to_check,
+            'addToMethod' => $add_to_method
+          ];
+          return; // Don't create an object, we'll handle entries directly
+        }
+        
         // Set element to parent class
         $this->set_to_parent = true;
         $this->set_to_parent_tag = $name;
@@ -284,12 +403,8 @@ class ErnParserController {
     }
     $elem = $this->instanciateClass($class_name);
 
-    // Tags can have the same names in the hierarchy (like ResourceGroup)
-    if (!array_key_exists($name, $this->pile)) {
-      $this->pile[$name] = $elem;
-    } else {
-      $this->pile[$name . "##" . random_int(2, 99999)] = $elem;
-    }
+    // Push element to stack (no need to check for duplicates - stack handles them naturally)
+    array_push($this->pile, ['tag' => $name, 'element' => $elem]);
 
     // Will process attributes later
     $this->attrs_to_process[count($this->pile)] = $attrs;
@@ -309,6 +424,9 @@ class ErnParserController {
    * @return DateInterval|\DedexBundle\Controller\class_name
    */
   private function instanciateClass($class_name) {
+    // Safety check: remove any array notation that might have slipped through
+    $class_name = preg_replace("/\[\]/", "", $class_name);
+    
     if ($class_name === "\DateInterval") {
       // For DateInterval can't instanciate with null
       return new DateInterval("PT0M0S");  // will be erased
@@ -344,12 +462,16 @@ class ErnParserController {
    * to its parent. Will delete this element (contained in the parent now).
    *
    * @param type $parser
-   * @param string $name
+   * @param string $name The name of the tag (may contain namespace prefix)
    */
   private function callbackEndElement($parser, string $name) {
+    // Check ignore list first (contains attribute names like "xmlns:ern" that should not be normalized)
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
       return;
     }
+
+    // Strip namespace prefix from tag name for consistency
+    $name = $this->stripNamespacePrefix($name);
 
     // Special handling for nested <Extent> elements
     if ($this->handling_nested_extent && $name === "Extent") {
@@ -360,7 +482,7 @@ class ErnParserController {
       $this->nested_extent_unit_of_measure = null;
       $this->nested_extent_value = "";
       
-      $parent = end($this->pile);
+      $parent = $this->getLastPileElement();
       if ($parent && $this->isExtentType(get_class($parent))) {
         // Set the accumulated value on the ExtentType parent
         $value_clean = trim($accumulated_value);
@@ -382,12 +504,36 @@ class ErnParserController {
       }
     }
 
-    $properties = array_filter(array_values((array) end($this->pile)));
-    if (count($properties) == 0 && !$this->set_to_parent) {
+    // Special handling for elements inside list contexts (like DealResourceReference inside InstantGratificationResourceList)
+    // List containers themselves are not added to the pile, so we need special handling
+    if ($this->current_list_context !== null) {
+      if ($name === $this->current_list_context['listTag']) {
+        // This is the list container element itself ending
+        // It was never added to the pile, so just reset the context and return
+        $this->current_list_context = null;
+        return;
+      } else {
+        // This is a child element of the list, not the list itself
+        // The value was already handled in setCurrentElement, so just return
+        return;
+      }
+    }
+
+    $last_element = $this->getLastPileElement();
+    $properties = $last_element ? array_filter(array_values((array) $last_element)) : [];
+    // Only remove empty elements if they are list containers (end with "List" or are known list types)
+    // Don't remove resource elements like SoundRecording, Image, etc. even if they appear empty,
+    // as they may have child elements that haven't been processed yet
+    $is_list_container = (substr($name, -4) === "List") || 
+                         (substr($name, -13) === "ReferenceList") ||
+                         (substr($name, -8) === "ListType");
+    
+    if (count($properties) == 0 && !$this->set_to_parent && $is_list_container) {
       // If we are leaving an element that is completely empty (the object
       // at the end of the pile, converted to an array, only contains emtpy
       // values), then to not add this element to parent. It's an empty List
       // element in DDEX, like ReleaseResourceReferenceList
+      // Only do this for list containers, not for resource elements
       array_pop($this->pile);
     } else if (!$this->set_to_parent) {
       // Process attributes now.
@@ -418,6 +564,8 @@ class ErnParserController {
     // Reset parent setting
     $this->set_to_parent = false;
     $this->set_to_parent_tag = "";
+
+    // Note: List context is now reset earlier when the list element ends (see above)
 
     // Reset last element
     $this->lastElement = [];
@@ -459,17 +607,291 @@ class ErnParserController {
   private function attachToParent() {
     if (count($this->pile) < 2) {
       // We are done, attach it to $this->ern
-      $this->ern = end($this->pile);
+      $this->ern = $this->getLastPileElement();
       return;
     }
 
-    $keys = array_keys($this->pile);
-    $child_tag = end($keys);
-    $child = $this->pile[$child_tag];
+    $last_entry = $this->getLastPileEntry();
+    $child_tag = $last_entry['tag'];
+    $child = $last_entry['element'];
 
-    [$func_name, $parent] = $this->getValidFunctionName("set", $child_tag, $child);
-
+    $pile_count = count($this->pile);
+    $immediate_parent_index = $pile_count - 2; // Parent is second-to-last
+    $immediate_parent = isset($this->pile[$immediate_parent_index]) && isset($this->pile[$immediate_parent_index]['element']) 
+      ? $this->pile[$immediate_parent_index]['element'] 
+      : null;
+    
+    $func_name = null;
+    $parent = null;
+    
+    // Priority 1: Check immediate parent first
+    // This ensures properties attach to their immediate parent rather than an ancestor
+    // (e.g., ReleaseResourceReference on ResourceGroupContentItem, not on Release)
+    if ($immediate_parent !== null && is_object($immediate_parent)) {
+      // First, try addTo* methods (for list properties)
+      $add_to_methods = ["addTo" . $child_tag, "addTo" . $child_tag . "List"];
+      foreach ($add_to_methods as $add_to_method) {
+        if ($this->cachedMethodExists($immediate_parent, $add_to_method)) {
+          $immediate_parent->$add_to_method($child);
+          return;
+        }
+      }
+      
+      // Then, try set* methods, but only if they don't expect an array (single-value properties)
+      // Check exact match first, then plural, then List (List methods are more likely to expect arrays)
+      $set_methods = ["set" . $child_tag, "set" . $child_tag . "s", "set" . $child_tag . "List"];
+      foreach ($set_methods as $set_method) {
+        if ($this->cachedMethodExists($immediate_parent, $set_method)) {
+          // Check if the set* method expects an array - if so, it's a list property and we should skip it
+          // (we already checked addTo* above, so if we get here and it expects array, something is wrong)
+          $reflection_key = get_class($immediate_parent) . '::' . $set_method;
+          if (!isset($this->reflection_cache[$reflection_key])) {
+            try {
+              $this->reflection_cache[$reflection_key] = new ReflectionMethod($immediate_parent, $set_method);
+            } catch (\ReflectionException $e) {
+              // If reflection fails, skip this method
+              continue;
+            }
+          }
+          $rm = $this->reflection_cache[$reflection_key];
+          $params = $rm->getParameters();
+          if (count($params) > 0) {
+            $param = $params[0];
+            $type = $param->getType();
+            // If the parameter type is "array", this is a list property - skip it
+            // (we should have found addTo* method above)
+            if ($type !== null) {
+              // For PHP 7.2+, getType() returns ReflectionNamedType or ReflectionUnionType
+              // For PHP 8.0+, we need to check if it's a named type
+              // Handle both ReflectionNamedType and ReflectionUnionType
+              $type_name = null;
+              if (is_string($type)) {
+                // PHP 7.0-7.3: getType() can return a string
+                $type_name = $type;
+              } elseif (method_exists($type, 'getName')) {
+                // PHP 7.4+: ReflectionNamedType
+                $type_name = $type->getName();
+              } elseif (method_exists($type, '__toString')) {
+                // Fallback: try to convert to string
+                $type_name = (string)$type;
+              }
+              // Check if it's an array type (could be "array" or a union type containing array)
+              if ($type_name === 'array') {
+                continue; // Skip this set* method, it's for lists
+              }
+              // For PHP 8.0+ union types, check if array is one of the types
+              if (method_exists($type, 'getTypes')) {
+                $union_types = $type->getTypes();
+                foreach ($union_types as $union_type) {
+                  $union_type_name = null;
+                  if (is_string($union_type)) {
+                    $union_type_name = $union_type;
+                  } elseif (method_exists($union_type, 'getName')) {
+                    $union_type_name = $union_type->getName();
+                  }
+                    if ($union_type_name === 'array') {
+                      continue 2; // Skip this set* method, it's for lists
+                    }
+                }
+              }
+            }
+          }
+          // This set* method doesn't expect an array, so it's a single-value property - use it
+          $immediate_parent->$set_method($child);
+          return;
+        }
+      }
+    }
+    
+    // Priority 3: Search backwards (only if immediate parent has no matching method)
+    // This handles cases where the immediate parent might not have the method
+    // (e.g., TechnicalDetails should be on SoundRecording, not ResourceList)
+    $start_index = $immediate_parent_index - 1; // Start from element before immediate parent
+    
+    // First, try addTo* methods when searching backwards (for list properties)
+    $add_to_methods = ["addTo" . $child_tag, "addTo" . $child_tag . "List"];
+    for ($i = $start_index; $i >= 0; $i--) {
+      if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
+        continue;
+      }
+      $elem = $this->pile[$i]['element'];
+      if (!is_object($elem)) {
+        continue;
+      }
+      foreach ($add_to_methods as $add_to_method) {
+        if ($this->cachedMethodExists($elem, $add_to_method)) {
+          $func_name = $add_to_method;
+          $parent = $elem;
+          break 2;
+        }
+      }
+    }
+    
+    // If addTo* not found, try set* methods when searching backwards (for single-value properties)
+    // But only if they don't expect an array
+    if ($func_name === null) {
+      $set_methods = ["set" . $child_tag, "set" . $child_tag . "s", "set" . $child_tag . "List"];
+      for ($i = $start_index; $i >= 0; $i--) {
+        if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
+          continue;
+        }
+        $elem = $this->pile[$i]['element'];
+        if (!is_object($elem)) {
+          continue;
+        }
+        foreach ($set_methods as $set_method) {
+          if ($this->cachedMethodExists($elem, $set_method)) {
+            // Check if the set* method expects an array - if so, skip it (it's a list property)
+            $reflection_key = get_class($elem) . '::' . $set_method;
+            if (!isset($this->reflection_cache[$reflection_key])) {
+              try {
+                $this->reflection_cache[$reflection_key] = new ReflectionMethod($elem, $set_method);
+              } catch (\ReflectionException $e) {
+                // If reflection fails, skip this method
+                continue;
+              }
+            }
+            $rm = $this->reflection_cache[$reflection_key];
+            $params = $rm->getParameters();
+            if (count($params) > 0) {
+              $param = $params[0];
+              $type = $param->getType();
+              // If the parameter type is "array", this is a list property - skip it
+              if ($type !== null) {
+                // For PHP 7.2+, getType() returns ReflectionNamedType or ReflectionUnionType
+                // For PHP 8.0+, we need to check if it's a named type
+                // Handle both ReflectionNamedType and ReflectionUnionType
+                $type_name = null;
+                if (is_string($type)) {
+                  // PHP 7.0-7.3: getType() can return a string
+                  $type_name = $type;
+                } elseif (method_exists($type, 'getName')) {
+                  // PHP 7.4+: ReflectionNamedType
+                  $type_name = $type->getName();
+                } elseif (method_exists($type, '__toString')) {
+                  // Fallback: try to convert to string
+                  $type_name = (string)$type;
+                }
+                // Check if it's an array type (could be "array" or a union type containing array)
+                if ($type_name === 'array') {
+                  continue; // Skip this set* method, it's for lists
+                }
+                // For PHP 8.0+ union types, check if array is one of the types
+                if (method_exists($type, 'getTypes')) {
+                  $union_types = $type->getTypes();
+                  foreach ($union_types as $union_type) {
+                    $union_type_name = null;
+                    if (is_string($union_type)) {
+                      $union_type_name = $union_type;
+                    } elseif (method_exists($union_type, 'getName')) {
+                      $union_type_name = $union_type->getName();
+                    }
+                    if ($union_type_name === 'array') {
+                      continue 2; // Skip this set* method, it's for lists
+                    }
+                  }
+                }
+              }
+            }
+            // This set* method doesn't expect an array, so it's a single-value property - use it
+            $func_name = $set_method;
+            $parent = $elem;
+            break 2;
+          }
+        }
+      }
+    }
+    
+    // If still not found, fall back to getValidFunctionName (for create* methods, etc.)
+    if ($func_name === null) {
+      [$func_name, $parent] = $this->getValidFunctionName("set", $child_tag, $child);
+    }
+    
     $parent->$func_name($child);
+  }
+
+  /**
+   * Cache-aware method_exists check
+   * 
+   * @param string|object $class Class name or object
+   * @param string $method Method name
+   * @return bool
+   */
+  private function cachedMethodExists($class, $method) {
+    $class_name = is_object($class) ? get_class($class) : $class;
+    $cache_key = $class_name . '::' . $method;
+    if (!isset($this->method_exists_cache[$cache_key])) {
+      $this->method_exists_cache[$cache_key] = method_exists($class, $method);
+    }
+    return $this->method_exists_cache[$cache_key];
+  }
+
+  /**
+   * Strip namespace prefix from tag name (e.g., "ern:NewReleaseMessage" -> "NewReleaseMessage")
+   * 
+   * @param string $tag Tag name that may contain namespace prefix
+   * @return string Tag name without namespace prefix
+   */
+  private function stripNamespacePrefix(string $tag): string {
+    // Check cache first
+    if (isset($this->namespace_cache[$tag])) {
+      return $this->namespace_cache[$tag];
+    }
+    
+    // Remove common namespace prefixes (ern:, ernm:, etc.)
+    // Pattern: any word characters followed by colon at the start
+    if (preg_match('/^[a-zA-Z0-9_]+:(.+)$/', $tag, $matches)) {
+      $normalized = $matches[1];
+    } else {
+      $normalized = $tag;
+    }
+    
+    // Cache the result
+    $this->namespace_cache[$tag] = $normalized;
+    return $normalized;
+  }
+
+  /**
+   * Get the last entry from the pile stack
+   * @return array|null ['tag' => string, 'element' => object] or null if empty
+   */
+  private function getLastPileEntry() {
+    if (empty($this->pile)) {
+      return null;
+    }
+    return end($this->pile);
+  }
+
+  /**
+   * Get the last element from the pile stack
+   * @return object|null The last element object or null if empty
+   */
+  private function getLastPileElement() {
+    $entry = $this->getLastPileEntry();
+    return $entry ? $entry['element'] : null;
+  }
+
+  /**
+   * Get the last tag name from the pile stack
+   * @return string|null The last tag name or null if empty
+   */
+  private function getLastPileTag() {
+    $entry = $this->getLastPileEntry();
+    return $entry ? $entry['tag'] : null;
+  }
+
+  /**
+   * Find an element in the pile by tag name, searching backwards from the end
+   * @param string $tag The tag name to search for
+   * @return object|null The element object or null if not found
+   */
+  private function findInPile(string $tag) {
+    for ($i = count($this->pile) - 1; $i >= 0; $i--) {
+      if ($this->pile[$i]['tag'] === $tag) {
+        return $this->pile[$i]['element'];
+      }
+    }
+    return null;
   }
 
   /**
@@ -491,6 +913,12 @@ class ErnParserController {
    * @return type
    */
   private function listPossibleFunctionNames($prefix, $tag) {
+    // Check cache first
+    $cache_key = $prefix . '::' . $tag;
+    if (isset($this->function_names_cache[$cache_key])) {
+      return $this->function_names_cache[$cache_key];
+    }
+    
     // It's possible this script added a ##\d+ information at the end of
     // the tag to avoid key duplicate. Remove it here.
     if (strpos($tag, "##") !== false) {
@@ -515,15 +943,14 @@ class ErnParserController {
 
         break;
       case "set":
-        // order is important
+        // order is important - try set* first for single values, addTo* for lists
+        $func_names[] = $prefix . $tag;
+        $func_names[] = $prefix . $tag . "s";
+        $func_names[] = $prefix . $tag . "List";
         $func_names[] = "addTo" . $tag;
         $func_names[] = "addTo" . $tag . "List";
         $func_names[] = "create" . $tag;
         $func_names[] = "create" . $tag . "List";
-        $func_names[] = $prefix . $tag;
-        $func_names[] = $prefix . $tag;
-        $func_names[] = $prefix . $tag . "s";
-        $func_names[] = $prefix . $tag . "List";
 
         // Hack for release deals. DDEX 4.1.1 is not consistent. It has a DealList
         // and ReleaseDeals in it. This parser would expect a ReleaseDealList instead
@@ -537,6 +964,8 @@ class ErnParserController {
         throw new \Exception("Prefix must be get or set");
     }
 
+    // Cache before returning
+    $this->function_names_cache[$cache_key] = $func_names;
     return $func_names;
   }
 
@@ -549,15 +978,88 @@ class ErnParserController {
    * @param string $value Value to set
    */
   private function setCurrentElement($value) {
+    // Check if we're inside a list context that uses addTo* methods
+    if ($this->current_list_context !== null) {
+      $value_clean = trim($value);
+      if ($value_clean !== "") {
+        $pile_tags = array_column($this->pile, 'tag');
+        $this->log($value_clean . ": " . implode("->", $pile_tags) . " (adding to " . $this->current_list_context['listTag'] . ")");
+        // Use the addTo* method directly
+        $add_to_method = $this->current_list_context['addToMethod'];
+        $parent = $this->current_list_context['parent'];
+        $parent->$add_to_method($value_clean);
+      }
+      return;
+    }
+
+    // Special handling for complex types with simpleContent (like ReleaseResourceReferenceType)
+    // These types have a value() method to set the text content directly on the object
+    // We should set the value on the current element, not create a new object
+    if (!$this->set_to_parent && count($this->pile) > 0) {
+      $current_element = $this->getLastPileElement();
+      if ($current_element !== null && is_object($current_element) && method_exists($current_element, 'value')) {
+        // If the previous element was the same, concatenate value
+        // xml_parser is known to split values when encountering multibyte chars
+        $current_tag = $this->getLastPileTag();
+        if (!empty($this->lastElement) && $this->lastElement[0] === $current_element && $this->lastElement[1] === $current_tag) {
+          $value = $this->lastElement[2] . $value;
+        }
+        $value_clean = trim($value);
+        if ($value_clean !== "") {
+          if ($this->display_log) {
+            $pile_tags = array_column($this->pile, 'tag');
+            $this->log($value_clean . ": " . implode("->", $pile_tags) . " (setting value on current element)");
+          }
+          // Centralized date formatting: format date strings before setting value
+          // This ensures all date types get consistent formatting regardless of ERN version
+          $value_clean = $this->formatDateValueForObject($current_element, $value_clean);
+          
+          // For DateTime-based types, use reflection to set formatted string directly
+          // This avoids needing entity class modifications
+          $class_name = get_class($current_element);
+          if (is_subclass_of($class_name, EventDateTimeType::class) ||
+              $this->isEventDateTimeWithoutFlagsType($class_name) ||
+              $class_name === 'DedexBundle\\Entity\\DdexC\\EventDateType') {
+            // Parse the string to DateTime, then set formatted string via reflection
+            try {
+              $dt = $this->parseDateString($value_clean);
+              if ($dt !== null) {
+                $dt->setTimezone(new \DateTimeZone('UTC'));
+                $isDateTimeType = is_subclass_of($class_name, EventDateTimeType::class) ||
+                                  $this->isEventDateTimeWithoutFlagsType($class_name);
+                $this->setFormattedDateValue($current_element, $dt, $isDateTimeType);
+                // Also call value() to maintain compatibility (stores DateTime internally)
+                $current_element->value($dt);
+              }
+            } catch (\Exception $e) {
+              // Fallback to direct value() call if parsing fails
+              $current_element->value($value_clean);
+            }
+          } else {
+            // For string-based types, just set the value directly
+            $current_element->value($value_clean);
+          }
+          $this->lastElement = [$current_element, $current_tag, $value];
+        }
+        return; // Don't process further - value is set on current element
+      }
+    }
+
     // Use last element in pile
-    $keys = array_keys($this->pile);
+    $pile_count = count($this->pile);
 
     if ($this->set_to_parent) {
-      $elem = end($this->pile);
+      $elem = $this->getLastPileElement();
       $tag = $this->set_to_parent_tag;
     } else {
-      $elem = $this->pile[$keys[count($keys) - 2]];
-      $tag = end($keys);
+      // Get parent element (second-to-last) and current tag (last)
+      if ($pile_count >= 2) {
+        $elem = $this->pile[$pile_count - 2]['element'];
+        $tag = $this->getLastPileTag();
+      } else {
+        $elem = $this->getLastPileElement();
+        $tag = $this->getLastPileTag();
+      }
     }
     // If the previous element was the same and had the same tag, concatenate value
     // xml_parser is known to split values when encountering multibyte chars and call the character_data_handler multiple times
@@ -565,19 +1067,31 @@ class ErnParserController {
       $value = $this->lastElement[2] . $value;
     }
     $value_clean = trim($value);
-    $this->log($value_clean . ": " . implode("->", array_keys($this->pile)));
+    if ($this->display_log) {
+      $pile_tags = array_column($this->pile, 'tag');
+      $this->log($value_clean . ": " . implode("->", $pile_tags));
+    }
     [$func_name, $elem] = $this->getValidFunctionName("set", $tag, $elem);
 
     // It's possible we're trying to set a text but it's expecting an
     // object (where text should be placed in value).
     $value_inst = $this->instanciateTypeFromDoc($elem, $func_name, $value_clean);
+    
+    // If parsing returned null (empty/invalid value), skip setting the value
+    if ($value_inst === null) {
+      return;
+    }
 
     $this->lastElement = [$elem, $tag, $value];
 
     if ($this->set_to_parent) {
       $elem->$func_name($value_inst);
     } else {
-      $this->pile[$tag] = $value_inst;
+      // Update the last element in the stack
+      $last_index = count($this->pile) - 1;
+      if ($last_index >= 0) {
+        $this->pile[$last_index]['element'] = $value_inst;
+      }
     }
   }
 
@@ -594,48 +1108,50 @@ class ErnParserController {
   private function getValidFunctionName($prefix, $tag, $value = null) {
     $func_names = $this->listPossibleFunctionNames($prefix, $tag);
 
-    $elem = end($this->pile);
+    $pile_count = count($this->pile);
+    $start_index = $pile_count - 1;
 
     // If type is complex, always start at previous than end,
     // as end will be itself
-    if ($value != null && !$this->set_to_parent && !in_array(get_class($value), ["string", "int", "bool", "float", "mixed"])) {
-      $elem = prev($this->pile);
+    if ($value != null && !$this->set_to_parent && is_object($value) && !in_array(get_class($value), ["string", "int", "bool", "float", "mixed"])) {
+      $start_index = $pile_count - 2;
     }
 
-    while (true) {
+    $i = $start_index;
+    while ($i >= 0) {
+      // Safety check: ensure pile entry exists and has element
+      if (!isset($this->pile[$i]) || !isset($this->pile[$i]['element'])) {
+        $i--;
+        continue;
+      }
+      
+      $elem = $this->pile[$i]['element'];
+      
+      // Safety check: ensure element is an object
+      if (!is_object($elem)) {
+        $i--;
+        continue;
+      }
+      
       $function_used = false;
       foreach ($func_names as $func_name) {
-        if (!method_exists($elem, $func_name)) {
+        if (!$this->cachedMethodExists($elem, $func_name)) {
           continue;
         }
         $function_used = true;
-        break 2;
+        return array($func_name, $elem);
       }
 
       // Continue with previous element if exists
-      $elem = prev($this->pile);
-      if ($elem === false) {
-        throw new Exception("No functions found for this tag: $tag. Path is " . implode(",", array_keys($this->pile)));
-      }
+      $i--;
     }
 
-    return array($func_name, $elem);
+    // No function found
+    $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
+    $pile_tags = array_column($this->pile, 'tag');
+    throw new Exception("No functions found for this tag: $tag. Path is " . implode(",", $pile_tags) . $fileInfo);
   }
 
-  private function expectedParamIsArray($class, $func_name) {
-    $method = new ReflectionMethod($class, $func_name);
-
-    if (count($method->getParameters()) != 1) {
-      throw new Exception("This reflection method only supports 1 parameter");
-    }
-
-    /* @var $param ReflectionParameter */
-    $param = $method->getParameters()[0];
-    $type = $param->getType();
-
-    $is_array = $param->isArray();
-    return $is_array;
-  }
 
   /**
    * From the doc of a class and function (guessed from $tag), return the type
@@ -646,17 +1162,54 @@ class ErnParserController {
    * @return string
    */
   private function getTypeOfElementFromDoc($class, $tag) {
-    [$function_name, $class] = $this->getValidFunctionName("get", $tag);
+    // Check cache first
+    $class_name = is_object($class) ? get_class($class) : $class;
+    $cache_key = $class_name . '::' . $tag;
+    if (isset($this->type_cache[$cache_key])) {
+      return $this->type_cache[$cache_key];
+    }
+    
+    // First, try to find the method on the provided parent class
+    // This is important for maintaining context when the parent might not be at the end of the pile
+    $func_names = $this->listPossibleFunctionNames("get", $tag);
+    $function_name = null;
+    $found_class = null;
+    
+    // Check the provided parent class first
+    foreach ($func_names as $func_name) {
+      if ($this->cachedMethodExists($class, $func_name)) {
+        $found_class = $class;
+        $function_name = $func_name;
+        break;
+      }
+    }
+    
+    // If not found on the provided class, search through the pile (backward compatibility)
+    if ($function_name === null) {
+      [$function_name, $found_class] = $this->getValidFunctionName("get", $tag);
+    }
 
-    $rc = new ReflectionMethod($class, $function_name);
+    // Cache ReflectionMethod instance
+    $reflection_key = (is_object($found_class) ? get_class($found_class) : $found_class) . '::' . $function_name;
+    if (!isset($this->reflection_cache[$reflection_key])) {
+      $this->reflection_cache[$reflection_key] = new ReflectionMethod($found_class, $function_name);
+    }
+    $rc = $this->reflection_cache[$reflection_key];
+    
     $doc = $rc->getDocComment();
-    preg_match("/@return (\S+).*/", $doc, $matches);
+    // Match @return type, handling both single types and array types (with [])
+    preg_match("/@return\s+([^\s\[\]]+)(\[\])?/", $doc, $matches);
     if (count($matches) > 1) {
-      $type = str_replace("[]", "", $matches[1]);
+      $type = $matches[1]; // Get the base type without []
+      // Ensure we remove any [] that might have been captured separately
+      $type = preg_replace("/\[\]/", "", $type);
+      $type = trim($type);
     } else {
       $type = "\\DedexBundle\\Entity\\Ern{$this->version}\\{$tag}Type";
     }
 
+    // Cache the result
+    $this->type_cache[$cache_key] = $type;
     return $type;
   }
 
@@ -690,14 +1243,19 @@ class ErnParserController {
     }
 
     $type = $matches[1];
+    // Remove [] from array types (e.g., "PartyIdType[]" -> "PartyIdType")
+    $type = preg_replace("/\[\]/", "", $type);
+    $type = trim($type);
     $this->log("create type $type");
     if ($type == "\DateTime") {
-      // Remove milliseconds if any
-      $value_default = $value_default ?? '0000-00-00T00:00:00';
-      $value = preg_replace("/\.\d+\+/", "+", $value_default);
-      // Support both ATOM or regular datetime format
-      $format = (mb_strlen($value) > mb_strlen('0000-00-00T00:00:00')) ? "Y-m-d\TH:i:sP" : "Y-m-d\TH:i:s";
-      $new_elem = DateTime::createFromFormat($format, $value);
+      // Use unified date parsing function
+      $new_elem = $this->parseDateString($value_default);
+      // If parsing returned null (empty/invalid value), skip setting the value
+      if ($new_elem === null) {
+        return null;
+      }
+      // DO NOT convert to UTC - preserve original timezone for DateTime objects
+      // The tests expect the time as it appears in the XML, not converted to UTC
     } elseif ($type == "\DateInterval") {
         // Check for ISO8601:2004 format
         preg_match('/^P(?:(\d+D))?(T(?:(\d+H))?(?:(\d+M))?(?:(\d+(?:\.\d+)?S))?)?$/i', $value_default, $matches);
@@ -714,11 +1272,63 @@ class ErnParserController {
             }
         }
     } elseif (is_subclass_of($type, EventDateTimeType::class)) {
-        $new_elem = new $type(new DateTime($value_default));
+        // EventDateTimeType expects a DateTime object
+        // Parse the date string and create DateTime, then convert to UTC for consistent formatting
+        $dt = $this->parseDateString($value_default);
+        if ($dt === null) {
+          return null;
+        }
+        // Convert to UTC for consistent formatting
+        $dt->setTimezone(new \DateTimeZone('UTC'));
+        $new_elem = new $type($dt);
+        // Use reflection to set formatted string in __value (avoids entity class modifications)
+        $this->setFormattedDateValue($new_elem, $dt, true); // true = date-time format
+    } elseif ($this->isEventDateTimeWithoutFlagsType($type)) {
+        // EventDateTimeWithoutFlagsType (used in ERN 4.3) expects a DateTime object
+        // Parse the date string and create DateTime, then convert to UTC for consistent formatting
+        $dt = $this->parseDateString($value_default);
+        if ($dt === null) {
+          return null;
+        }
+        // Convert to UTC for consistent formatting
+        $dt->setTimezone(new \DateTimeZone('UTC'));
+        $new_elem = new $type($dt);
+        // Use reflection to set formatted string in __value (avoids entity class modifications)
+        $this->setFormattedDateValue($new_elem, $dt, true); // true = date-time format
     } elseif ($type === '\\' . Ern341EventDateType::class) {
-        $new_elem = new $type(new DateTime($value_default));
+        // DdexC\EventDateType (ERN 341) expects a DateTime object
+        $dt = $this->parseDateString($value_default);
+        if ($dt === null) {
+          return null;
+        }
+        // Convert to UTC for consistent formatting
+        $dt->setTimezone(new \DateTimeZone('UTC'));
+        $new_elem = new $type($dt);
+        // Use reflection to set formatted string in __value (avoids entity class modifications)
+        $this->setFormattedDateValue($new_elem, $dt, false); // false = date-only format
     } elseif (is_subclass_of($type, EventDateType::class)) {
-        $new_elem = new $type($value_default);
+        // Check if this is DdexC\EventDateType (expects DateTime)
+        if ($type === 'DedexBundle\\Entity\\DdexC\\EventDateType') {
+          // DdexC\EventDateType expects DateTime
+          $dt = $this->parseDateString($value_default);
+          if ($dt === null) {
+            return null;
+          }
+          // Convert to UTC for consistent formatting
+          $dt->setTimezone(new \DateTimeZone('UTC'));
+          $new_elem = new $type($dt);
+          // Use reflection to set formatted string in __value (avoids entity class modifications)
+          $this->setFormattedDateValue($new_elem, $dt, false); // false = date-only format
+        } else {
+          // For all other EventDateType classes, they expect strings
+          // EventDateType should remain date-only (YYYY-MM-DD) - don't add time component
+          // Only normalize timezone if present (Z -> +00:00)
+          $formatted = $value_default;
+          if (substr($formatted, -1) === 'Z') {
+            $formatted = substr($formatted, 0, -1) . '+00:00';
+          }
+          $new_elem = new $type($formatted);
+        }
     } else {
       try {
         $new_elem = new $type($value_default);
@@ -729,6 +1339,217 @@ class ErnParserController {
       }
     }
     return $new_elem;
+  }
+
+  /**
+   * Centralized date formatting: formats date values based on the object type.
+   * This ensures consistent date formatting across all ERN versions without
+   * requiring modifications to each entity class.
+   * 
+   * IMPORTANT: 
+   * - EventDateType (start_date/end_date) should remain date-only (YYYY-MM-DD)
+   * - EventDateTimeType (start_time/end_time) should be date-time with timezone (YYYY-MM-DDThh:mm:ss+00:00)
+   * 
+   * @param object $obj The object receiving the date value
+   * @param string $value Date string from XML
+   * @return string Formatted date string
+   */
+  private function formatDateValueForObject($obj, string $value): string {
+    $class_name = get_class($obj);
+    
+    // EventDateTimeType and EventDateTimeWithoutFlagsType: format as date-time with timezone
+    if (is_subclass_of($class_name, EventDateTimeType::class) ||
+        $this->isEventDateTimeWithoutFlagsType($class_name)) {
+      // Format the date string to include time and timezone
+      return $this->formatDateStringForEventDateType($value);
+    }
+    
+    // EventDateType: keep as date-only (don't add time component)
+    // The value should remain in YYYY-MM-DD format as per XSD specification
+    if (is_subclass_of($class_name, EventDateType::class)) {
+      // Only normalize timezone if present (Z -> +00:00), but don't add time
+      if (substr($value, -1) === 'Z') {
+        return substr($value, 0, -1) . '+00:00';
+      }
+      // Return as-is for date-only format
+      return $value;
+    }
+    
+    // Not a date type, return as-is
+    return $value;
+  }
+
+  /**
+   * Check if a class is EventDateTimeWithoutFlagsType (used in ERN 4.3)
+   * 
+   * @param string $class_name
+   * @return bool
+   */
+  private function isEventDateTimeWithoutFlagsType(string $class_name): bool {
+    // Check for EventDateTimeWithoutFlagsType in various ERN versions
+    return strpos($class_name, 'EventDateTimeWithoutFlagsType') !== false;
+  }
+
+  /**
+   * Use reflection to set formatted date string in __value property.
+   * This allows us to avoid modifying entity classes - all formatting is done in the parser.
+   * 
+   * @param object $obj The entity object (EventDateType, EventDateTimeType, etc.)
+   * @param \DateTime $dt The DateTime object to format
+   * @param bool $isDateTimeType If true, format as date-time (Y-m-d\TH:i:s+00:00), if false format as date-only (Y-m-d)
+   */
+  private function setFormattedDateValue($obj, \DateTime $dt, bool $isDateTimeType): void {
+    try {
+      $reflection = new \ReflectionClass($obj);
+      $property = $reflection->getProperty('__value');
+      $property->setAccessible(true);
+      
+      // Format based on type
+      if ($isDateTimeType) {
+        // EventDateTimeType: format as date-time with timezone
+        $formatted = $dt->format('Y-m-d\TH:i:s') . '+00:00';
+      } else {
+        // EventDateType: format as date-only
+        $formatted = $dt->format('Y-m-d');
+      }
+      
+      $property->setValue($obj, $formatted);
+    } catch (\ReflectionException $e) {
+      // If reflection fails, log but don't break parsing
+      $this->log("Warning: Could not set formatted date value via reflection: " . $e->getMessage());
+    }
+  }
+
+  /**
+   * Format a date string for EventDateType (string-based).
+   * Ensures date-only formats get time component and all dates have timezone.
+   * 
+   * @param string $value Date string from XML
+   * @return string Formatted date string (Y-m-d\TH:i:s+00:00 format)
+   */
+  private function formatDateStringForEventDateType(string $value): string {
+    $value = trim($value);
+    if (empty($value)) {
+      return $value;
+    }
+    
+    // Remove milliseconds if any
+    $value = preg_replace("/\.\d+\+/", "+", $value);
+    $value = preg_replace("/\.\d+Z/", "Z", $value);
+    
+    // Date-only format: add time and timezone
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+      return $value . 'T00:00:00+00:00';
+    }
+    
+    // Date-time without timezone: add UTC timezone
+    if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/', $value)) {
+      return $value . '+00:00';
+    }
+    
+    // Date-time with Z: convert to +00:00
+    if (substr($value, -1) === 'Z') {
+      return substr($value, 0, -1) . '+00:00';
+    }
+    
+    // Already has timezone: return as-is (should already be in correct format)
+    return $value;
+  }
+
+  /**
+   * Parse a date string into a DateTime object.
+   * If time is missing, defaults to 00:00:00 UTC.
+   * Preserves original timezone if present, otherwise defaults to UTC.
+   * 
+   * @param string $value Date string (can be date-only or date-time)
+   * @return DateTime|null Returns DateTime object or null if value is empty
+   * @throws Exception If date cannot be parsed
+   */
+  private function parseDateString(string $value): ?DateTime {
+    $original_value = $value;
+    $value = trim($value);
+    
+    // Empty values return null
+    if (empty($value)) {
+      return null;
+    }
+    
+    $is_date_only = false;
+    $has_timezone = false;
+    $timezone = null;
+    
+    // Remove milliseconds if any (e.g., "2024-01-15T10:30:00.123+00:00" -> "2024-01-15T10:30:00+00:00")
+    $value = preg_replace("/\.\d+\+/", "+", $value);
+    $value = preg_replace("/\.\d+Z/", "Z", $value);
+    
+    // Check if this is a date-only format (YYYY-MM-DD) without time
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+      // Date-only format: default to 00:00:00 UTC
+      $value .= 'T00:00:00+00:00';
+      $is_date_only = true;
+      $timezone = new \DateTimeZone('UTC');
+      $this->log("Date-only format detected, defaulting to 00:00:00 UTC: " . $value);
+    }
+    // Check if this is a date with time but no timezone (YYYY-MM-DDTHH:MM:SS)
+    elseif (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/', $value)) {
+      // Date-time without timezone: default to UTC
+      $value .= '+00:00';
+      $timezone = new \DateTimeZone('UTC');
+      $this->log("Date-time without timezone detected, defaulting to UTC: " . $value);
+    }
+    // Check if this is a date with time and milliseconds but no timezone (YYYY-MM-DDTHH:MM:SS.mmm)
+    elseif (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+$/', $value)) {
+      // Date-time with milliseconds but no timezone: default to UTC
+      $value .= '+00:00';
+      $timezone = new \DateTimeZone('UTC');
+      $this->log("Date-time with milliseconds but no timezone detected, defaulting to UTC: " . $value);
+    }
+    // Handle UTC timezone indicator (Z) - convert to +00:00 for consistent formatting
+    elseif (substr($value, -1) === 'Z') {
+      $has_timezone = true;
+      // Convert Z to +00:00 for consistent formatting
+      $value = substr($value, 0, -1) . '+00:00';
+    }
+    // Check if it has a timezone offset (e.g., +04:00, -05:00)
+    elseif (preg_match('/[+-]\d{2}:\d{2}$/', $value)) {
+      $has_timezone = true;
+      // Extract timezone from the value
+      if (preg_match('/([+-]\d{2}):(\d{2})$/', $value, $tz_matches)) {
+        $tz_offset = $tz_matches[1] . $tz_matches[2]; // e.g., "+0400"
+        try {
+          $timezone = timezone_open(sprintf('Etc/GMT%s', str_replace(['+', '-'], ['-', '+'], $tz_offset)));
+        } catch (\Exception $e) {
+          // Fallback to UTC if timezone parsing fails
+          $timezone = new \DateTimeZone('UTC');
+        }
+      }
+    }
+    
+    // Use DateTime constructor which handles timezones correctly
+    // It will preserve the original timezone if present, or use the default timezone
+    try {
+      // Create DateTime - it will parse the timezone from the string if present
+      $new_elem = new DateTime($value);
+      
+      // If this was originally a date-only format, ensure time is 00:00:00
+      if ($is_date_only) {
+        $new_elem->setTime(0, 0, 0);
+        // For date-only, explicitly set to UTC
+        $new_elem->setTimezone(new \DateTimeZone('UTC'));
+      } elseif (!$has_timezone && $timezone !== null) {
+        // If we added a timezone (date-time without timezone), set it
+        $new_elem->setTimezone($timezone);
+      }
+      // DO NOT convert to UTC here - preserve original timezone
+      // DateTime objects (like message_date) should keep their original timezone
+      // EventDateType/EventDateTimeType will convert to UTC when needed
+      
+      return $new_elem;
+    } catch (\Exception $e) {
+      // DateTime constructor failed - value is likely invalid
+      $fileInfo = $this->file_path ? " File: {$this->file_path}" : "";
+      throw new Exception("Failed to parse date value: '{$original_value}'" . $fileInfo, 0, $e);
+    }
   }
 
   protected function intervalFromIso86012004String(string $value): DateInterval
@@ -947,9 +1768,17 @@ class ErnParserController {
    *
    * @param string $file_path Location of XML path
    * @return Ddex The main entity modelling the full DDex file
-   * @throws Exception If file not found or XML can't be loaded
    */
   public function parse(string $file_path) {
+    // Clear all caches at start of each parse
+    $this->method_exists_cache = [];
+    $this->reflection_cache = [];
+    $this->namespace_cache = [];
+    $this->type_cache = [];
+    $this->function_names_cache = [];
+    
+    $this->file_path = $file_path;
+
     if (!file_exists($file_path)) {
       throw new FileNotFoundException("File not found: $file_path");
     }
