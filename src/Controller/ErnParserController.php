@@ -280,7 +280,15 @@ class ErnParserController {
       "xs:schemaLocation",
       "xsi:schemaLocation",
       "xmlns:avs",
+      // FUGA proprietary extension (not in DDEX ERN MessageHeader schema)
+      "SkipChecksum",
   ];
+
+  /**
+   * Depth of ignored elements currently open (skip character data while > 0).
+   * @var int
+   */
+  private int $ignored_element_depth = 0;
 
   /**
    * Function called when the parser encounters a tag opening
@@ -292,6 +300,7 @@ class ErnParserController {
   private function callbackStartElement($parser, string $name, array $attrs) {
     // Check ignore list first (contains attribute names like "xmlns:ern" that should not be normalized)
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
+      $this->ignored_element_depth++;
       return;
     }
 
@@ -467,6 +476,7 @@ class ErnParserController {
   private function callbackEndElement($parser, string $name) {
     // Check ignore list first (contains attribute names like "xmlns:ern" that should not be normalized)
     if (in_array($name, $this->ignore_these_tags_or_attributes)) {
+      $this->ignored_element_depth = max(0, $this->ignored_element_depth - 1);
       return;
     }
 
@@ -1593,6 +1603,10 @@ class ErnParserController {
       return;
     }
 
+    if ($this->ignored_element_depth > 0) {
+      return;
+    }
+
     // Special handling for nested <Extent> elements
     if ($this->handling_nested_extent) {
       // Accumulate value (XML parser may split values across multiple calls)
@@ -1776,7 +1790,8 @@ class ErnParserController {
     $this->namespace_cache = [];
     $this->type_cache = [];
     $this->function_names_cache = [];
-    
+    $this->ignored_element_depth = 0;
+
     $this->file_path = $file_path;
 
     if (!file_exists($file_path)) {
