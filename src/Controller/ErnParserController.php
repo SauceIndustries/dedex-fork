@@ -598,6 +598,7 @@ class ErnParserController {
       'DedexBundle\\Entity\\Ern383\\ExtentType',
       'DedexBundle\\Entity\\Ern341\\ExtentType',
       'DedexBundle\\Entity\\Ern371\\ExtentType',
+      'DedexBundle\\Entity\\Ern37\\ExtentType',
       'DedexBundle\\Entity\\Ern32\\ExtentType',
       'DedexBundle\\Entity\\DdexC\\ExtentType',
     ];
@@ -1660,6 +1661,7 @@ class ErnParserController {
         "383",
         "341",
         "371",
+        "37",
         "32",
     ];
 
