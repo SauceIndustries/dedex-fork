@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:ern="http://ddex.net/xml/ern/371"
-   xmlns:avs="http://ddex.net/xml/avs/avs" targetNamespace="http://ddex.net/xml/ern/371"
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:ern="http://ddex.net/xml/ern/37"
+   xmlns:avs="http://ddex.net/xml/avs/avs" targetNamespace="http://ddex.net/xml/ern/37"
    elementFormDefault="unqualified" attributeFormDefault="unqualified">
    <xs:import namespace="http://ddex.net/xml/avs/avs"
       schemaLocation="http://ddex.net/xml/avs/avs_20161006.xsd"/>
