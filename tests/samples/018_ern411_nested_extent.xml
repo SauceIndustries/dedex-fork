@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ern:NewReleaseMessage
+   xmlns:ern="http://ddex.net/xml/ern/411"
+   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+   xsi:schemaLocation="http://ddex.net/xml/ern/411 release-notification.xsd"
+   ReleaseProfileVersionId="Audio" LanguageAndScriptCode="en">
+   <MessageHeader>
+      <MessageThreadId>Test1</MessageThreadId>
+      <MessageId>Test1.1</MessageId>
+      <MessageSender>
+         <PartyId>PADPIDA2013042401U</PartyId>
+         <PartyName>
+            <FullName>UniversalMusicGroup</FullName>
+         </PartyName>
+      </MessageSender>
+      <MessageRecipient>
+         <PartyId>PADPIDA2009101501Y</PartyId>
+         <PartyName>
+            <FullName>Sony DADC</FullName>
+         </PartyName>
+      </MessageRecipient>
+      <MessageCreatedDateTime>2013-11-26T14:30:00Z</MessageCreatedDateTime>
+   </MessageHeader>
+   <ResourceList>
+      <Image>
+         <ResourceReference>IMG1</ResourceReference>
+         <Type>FrontCoverImage</Type>
+         <ResourceId>
+            <ProprietaryId Namespace="PADPIDA2013042401U">PACKSHOT:0094631432057</ProprietaryId>
+         </ResourceId>
+         <ParentalWarningType>NotExplicit</ParentalWarningType>
+         <TechnicalDetails>
+            <TechnicalResourceDetailsReference>T1</TechnicalResourceDetailsReference>
+            <!-- Malformed-but-seen-in-the-wild nesting: <Extent> wrapped inside
+                 ImageHeight/ImageWidth instead of the value sitting directly on
+                 the ExtentType element. UnitOfMeasure rides on the Extent. -->
+            <ImageHeight><Extent>300</Extent></ImageHeight>
+            <ImageWidth><Extent UnitOfMeasure="Pixel">300</Extent></ImageWidth>
+            <File>
+               <URI>0094631432057.jpg</URI>
+            </File>
+         </TechnicalDetails>
+      </Image>
+   </ResourceList>
+</ern:NewReleaseMessage>

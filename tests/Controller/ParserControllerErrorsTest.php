@@ -68,7 +68,8 @@ class ParserControllerErrorTest extends TestCase {
     try {
       $parser->parse("tests/samples/005_not_valid_xsd.xml");
     } catch (\Exception $ex) {
-      $expected_message = "No functions found for this tag: FakeTag. Path is NewReleaseMessage,ResourceList,SoundRecording";
+      // The parser appends " File: <path>" to fingerprint the offending file.
+      $expected_message = "No functions found for this tag: FakeTag. Path is NewReleaseMessage,ResourceList,SoundRecording File: tests/samples/005_not_valid_xsd.xml";
       $this->assertEquals($expected_message, $ex->getMessage());
     }
   }
