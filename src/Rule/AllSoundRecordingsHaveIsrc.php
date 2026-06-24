@@ -47,7 +47,7 @@ class AllSoundRecordingsHaveIsrc extends Rule {
       foreach ($sr->getSoundRecordingId() as $sri) {
         $isrc = $sri->getISRC();
         
-        if (empty(trim($isrc))) {
+        if (empty(trim($isrc ?? ''))) {
           return false;
         }
       }
