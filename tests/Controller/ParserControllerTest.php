@@ -29,6 +29,31 @@ class ParserControllerTest extends TestCase {
     $this->assertEquals("MY_TAG", $parser_controller->cleanTag("MY:TAG"));
   }
 
+  /**
+   * Regression test: some senders (e.g. WMG) declare the ERN namespace with an
+   * arbitrary prefix such as "x" (xmlns:x) and use it on the root element. The
+   * namespace declaration must be ignored, not replayed as a child element.
+   * Before the fix this threw
+   * "No functions found for this tag: x. Path is NewReleaseMessage".
+   *
+   * tests/samples/020_xmlns_x_prefix.xml is sample 001 with the root namespace
+   * prefix changed from "ern" to "x".
+   */
+  public function testSample020XmlnsXPrefix() {
+    $xml_path = "tests/samples/020_xmlns_x_prefix.xml";
+    $parser_controller = new ErnParserController();
+    $parser_controller->setDisplayLog(false);
+    /* @var $ddex NewReleaseMessage */
+    $ddex = $parser_controller->parse($xml_path);
+
+    $this->assertInstanceOf(NewReleaseMessage::class, $ddex);
+    // Root attributes are still read despite the unusual namespace prefix
+    $this->assertEquals("ern/382", $ddex->getMessageSchemaVersionId());
+    $this->assertEquals("en", $ddex->getLanguageAndScriptCode());
+    // The full tree parsed, not just the root element
+    $this->assertCount(6, $ddex->getResourceList()->getSoundRecording());
+  }
+
   public function testSample001() {
     $xml_path = "tests/samples/001_audioalbum_complete.xml";
     $parser_controller = new ErnParserController();
