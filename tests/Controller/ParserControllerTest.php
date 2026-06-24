@@ -325,7 +325,8 @@ class ParserControllerTest extends TestCase {
     $this->assertEquals("GBCVZ1900196", $sound_recording->getSoundRecordingId()[0]->getIsrc());
     $this->assertEquals("A58863644450088", $sound_recording->getResourceReference());
     $this->assertEquals("Bloodbuzz Ohio", $sound_recording->getReferenceTitle()->getTitleText());
-    $this->assertEquals("PT00H04M39S", $sound_recording->getDuration()->format("PT%iH%iM%sS"));
+    // %H/%I/%S are the zero-padded hour/minute/second codes (%i is minutes, not hours)
+    $this->assertEquals("PT00H04M39S", $sound_recording->getDuration()->format("PT%HH%IM%SS"));
 
     // SoundRecordingDetailsByTerritory
     $this->assertCount(1, $sound_recording->getSoundRecordingDetailsByTerritory());
@@ -349,14 +350,16 @@ class ParserControllerTest extends TestCase {
     $track_release = $ddex->getReleaseList()->getRelease()[0];
     $this->assertEquals("GBCVZ1900196", $track_release->getReleaseId()[0]->getIsrc());
     $this->assertEquals("R58863644450088", $track_release->getReleaseReference()[0]);
-    $this->assertEquals("TrackRelease", $track_release->getReleaseType());
+    // ERN32 ReleaseType is a repeatable element, so getReleaseType() is an array
+    $this->assertEquals("TrackRelease", $track_release->getReleaseType()[0]->value());
 
     // Second release (Single/Album)
     /* @var $album_release Ern32ReleaseType */
     $album_release = $ddex->getReleaseList()->getRelease()[1];
     $this->assertEquals("191402011555", $album_release->getReleaseId()[0]->getIcpn());
     $this->assertEquals("R58863643750032", $album_release->getReleaseReference()[0]);
-    $this->assertEquals("Single", $album_release->getReleaseType());
+    // ERN32 ReleaseType is a repeatable element, so getReleaseType() is an array
+    $this->assertEquals("Single", $album_release->getReleaseType()[0]->value());
     $this->assertEquals("Bloodbuzz Ohio", $album_release->getReferenceTitle()->getTitleText());
 
     // DealList
@@ -365,9 +368,11 @@ class ParserControllerTest extends TestCase {
     
     // Check first deal
     $deal = $ddex->getDealList()->getReleaseDeal()[0];
-    $this->assertEquals("R58863643750032", $deal->getDealReleaseReference());
-    $this->assertEquals("Download", $deal->getDeal()->getDealTerms()->getUsage()[0]->getUseType());
-    $this->assertGreaterThan(200, count($deal->getDeal()->getDealTerms()->getTerritoryCode())); // Worldwide territories
+    // ERN32 DealReleaseReference is repeatable, so getDealReleaseReference() is an array
+    $this->assertEquals("R58863643750032", $deal->getDealReleaseReference()[0]);
+    // ERN32 Deal / UseType are repeatable, so getDeal() and getUseType() are arrays
+    $this->assertEquals("Download", $deal->getDeal()[0]->getDealTerms()->getUsage()[0]->getUseType()[0]->value());
+    $this->assertGreaterThan(200, count($deal->getDeal()[0]->getDealTerms()->getTerritoryCode())); // Worldwide territories
   }
 
   /**
@@ -413,7 +418,8 @@ class ParserControllerTest extends TestCase {
     $album_release = $ddex->getReleaseList()->getRelease()[3];
     $this->assertEquals("191402800869", $album_release->getReleaseId()[0]->getIcpn());
     $this->assertEquals("The Wren, The Wren", $album_release->getReferenceTitle()->getTitleText());
-    $this->assertEquals("Album", $album_release->getReleaseType());
+    // ERN32 ReleaseType is a repeatable element, so getReleaseType() is an array
+    $this->assertEquals("Album", $album_release->getReleaseType()[0]->value());
     
     // Album should reference all 3 sound recordings + image
     $this->assertCount(4, $album_release->getReleaseResourceReferenceList());
