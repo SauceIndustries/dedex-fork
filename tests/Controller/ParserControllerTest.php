@@ -54,6 +54,29 @@ class ParserControllerTest extends TestCase {
     $this->assertCount(6, $ddex->getResourceList()->getSoundRecording());
   }
 
+  /**
+   * Regression test for the stronger case: the ERN namespace is declared
+   * *solely* under an arbitrary prefix (xmlns:x), with no xmlns:ern present.
+   * detectVersion() must recognize the version from the ddex.net URL regardless
+   * of prefix; otherwise it throws XmlLoadException("Could not find the
+   * xmlns:ern...") before parsing even begins.
+   *
+   * tests/samples/021_xmlns_x_only.xml is sample 001 with xmlns:ern renamed to
+   * xmlns:x (no recognized prefix left).
+   */
+  public function testSample021XmlnsXOnly() {
+    $xml_path = "tests/samples/021_xmlns_x_only.xml";
+    $parser_controller = new ErnParserController();
+    $parser_controller->setDisplayLog(false);
+    /* @var $ddex NewReleaseMessage */
+    $ddex = $parser_controller->parse($xml_path);
+
+    $this->assertInstanceOf(NewReleaseMessage::class, $ddex);
+    $this->assertEquals("ern/382", $ddex->getMessageSchemaVersionId());
+    $this->assertEquals("en", $ddex->getLanguageAndScriptCode());
+    $this->assertCount(6, $ddex->getResourceList()->getSoundRecording());
+  }
+
   public function testSample001() {
     $xml_path = "tests/samples/001_audioalbum_complete.xml";
     $parser_controller = new ErnParserController();

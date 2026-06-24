@@ -1679,7 +1679,9 @@ class ErnParserController {
       }
 
       // Try to find ERN-Main 32 namespace first (http://ddex.net/xml/2010/ern-main/32)
-      $re_ern_main = '/xmlns:ernm?="https?:\/\/ddex.net\/xml\/2010\/ern-main\/(\d+)"/m';
+      // Match any namespace-declaration prefix (xmlns, xmlns:ern, xmlns:x, ...);
+      // the version is identified by the ddex.net URL, not the chosen prefix.
+      $re_ern_main = '/xmlns(?::[\w-]+)?="https?:\/\/ddex.net\/xml\/2010\/ern-main\/(\d+)"/m';
       preg_match_all($re_ern_main, $trimed, $matches_ern_main, PREG_SET_ORDER, 0);
       
       if (!empty($matches_ern_main)) {
@@ -1687,8 +1689,11 @@ class ErnParserController {
         break;
       }
 
-      // Try to find version in this line (standard ERN pattern)
-      $re = '/xmlns:ernm?="https?:\/\/ddex.net\/xml\/ern\/(\d+)"/m';
+      // Try to find version in this line (standard ERN pattern). Match any
+      // namespace-declaration prefix (xmlns, xmlns:ern, xmlns:x, ...) so a
+      // sender that declares the ERN namespace solely under an arbitrary prefix
+      // is still detected. The ddex.net/xml/ern URL anchors the match.
+      $re = '/xmlns(?::[\w-]+)?="https?:\/\/ddex.net\/xml\/ern\/(\d+)"/m';
       preg_match_all($re, $trimed, $matches, PREG_SET_ORDER, 0);
 
       if (empty($matches)) {
